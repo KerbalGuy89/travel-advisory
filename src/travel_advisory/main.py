@@ -485,14 +485,14 @@ class TravelAdvisoryPDF(FPDF):
 
     def header(self):
         if self.page_no() > 1:
-            self.set_font('Helvetica', 'B', 9)
+            self.set_font('Helvetica', 'B', 10)
             self.set_text_color(*self.MEDIUM_GRAY)
             self.cell(0, 8, 'US State Department Travel Advisories - High Risk Report', align='C')
             self.ln(8)
 
     def footer(self):
         self.set_y(-15)
-        self.set_font('Helvetica', 'I', 8)
+        self.set_font('Helvetica', 'I', 10)
         self.set_text_color(*self.MEDIUM_GRAY)
         self.cell(0, 10, f'Page {self.page_no()}', align='C')
 
@@ -558,17 +558,17 @@ class TravelAdvisoryPDF(FPDF):
 
         # Legend
         self.ln(15)
-        self.set_font('Helvetica', 'B', 10)
+        self.set_font('Helvetica', 'B', 12)
         self.set_text_color(*self.NAVY)
         self.cell(0, 6, 'Advisory Level Definitions:', align='C')
         self.ln(8)
 
-        self.set_font('Helvetica', '', 9)
+        self.set_font('Helvetica', 'B', 11)
         for level, name in LEVEL_NAMES.items():
             self.set_x(50)
             self.set_text_color(*self.get_level_color(level))
-            self.cell(0, 5, f'Level {level}: {name}')
-            self.ln(5)
+            self.cell(0, 6, f'Level {level}: {name}')
+            self.ln(6)
 
     def add_prohibited_section(self, prohibited_advisories: list[TravelAdvisory]):
         """Add the prohibited countries section (Texas EO GA-48)."""
@@ -588,14 +588,14 @@ class TravelAdvisoryPDF(FPDF):
         self.cell(0, 6, 'Texas Executive Order GA-48 - Foreign Adversaries')
         self.ln(6)
 
-        self.set_font('Helvetica', '', 9)
+        self.set_font('Helvetica', '', 11)
         self.set_x(10)
         legal_text = (
             "Per 15 CFR 791.4, the US Department of Commerce has designated the following "
             "countries as foreign adversaries. Texas Executive Order GA-48 (November 19, 2024) "
             "prohibits state employees from work-related travel to these countries."
         )
-        self.multi_cell(0, 4, self._clean_text(legal_text))
+        self.multi_cell(0, 5, self._clean_text(legal_text))
         self.ln(8)
 
         # List each prohibited country
@@ -618,20 +618,20 @@ class TravelAdvisoryPDF(FPDF):
 
             # Official name and advisory level
             self.set_text_color(*self.DARK_GRAY)
-            self.set_font('Helvetica', 'I', 9)
-            self.multi_cell(0, 4, f"Official: {info['official_name']}",
+            self.set_font('Helvetica', 'I', 11)
+            self.multi_cell(0, 5, f"Official: {info['official_name']}",
                             new_x='LMARGIN', new_y='NEXT')
 
             if matching:
-                self.set_font('Helvetica', '', 9)
+                self.set_font('Helvetica', '', 11)
                 level_text = f"State Dept Advisory: Level {matching.overall_level} - {LEVEL_NAMES.get(matching.overall_level, '')}"
                 self.set_text_color(*self.get_level_color(matching.overall_level))
-                self.multi_cell(0, 4, level_text,
+                self.multi_cell(0, 5, level_text,
                                 new_x='LMARGIN', new_y='NEXT')
 
                 self.set_text_color(*self.MEDIUM_GRAY)
-                self.set_font('Helvetica', '', 8)
-                self.multi_cell(0, 4, f"Last Updated: {matching.last_updated.strftime('%B %d, %Y')}",
+                self.set_font('Helvetica', '', 10)
+                self.multi_cell(0, 5, f"Last Updated: {matching.last_updated.strftime('%B %d, %Y')}",
                                 new_x='LMARGIN', new_y='NEXT')
                 self.ln(2)
             else:
@@ -650,7 +650,7 @@ class TravelAdvisoryPDF(FPDF):
             "References:\n"
             "- Texas EO GA-48: gov.texas.gov/uploads/files/press/EO-GA-48_Hardening_State_Government_FINAL_11-19-2024.pdf\n"
             "- 15 CFR 791.4: ecfr.gov/current/title-15/subtitle-B/chapter-VII/subchapter-E/part-791/subpart-A/section-791.4"
-        ))
+        ), align='L')
 
     def add_advisory_entry(self, advisory: TravelAdvisory):
         """Add a single country advisory entry to the report."""
@@ -662,7 +662,7 @@ class TravelAdvisoryPDF(FPDF):
         level_color = self.get_level_color(advisory.overall_level)
         self.set_fill_color(*level_color)
         self.set_text_color(255, 255, 255)
-        self.set_font('Helvetica', 'B', 12)
+        self.set_font('Helvetica', 'B', 14)
 
         # Header with country name and level
         header_text = f"  {advisory.country_name} - Level {advisory.overall_level}"
@@ -671,50 +671,71 @@ class TravelAdvisoryPDF(FPDF):
 
         # Advisory level description
         self.set_text_color(*self.DARK_GRAY)
-        self.set_font('Helvetica', 'I', 9)
+        self.set_font('Helvetica', 'I', 11)
         level_desc = LEVEL_NAMES.get(advisory.overall_level, "")
-        self.multi_cell(0, 5, level_desc,
+        self.multi_cell(0, 6, level_desc,
                         new_x='LMARGIN', new_y='NEXT')
         self.ln(1)
 
         # Last updated
-        self.set_font('Helvetica', '', 8)
+        self.set_font('Helvetica', '', 10)
         self.set_text_color(*self.MEDIUM_GRAY)
-        self.multi_cell(0, 4, f'Last Updated: {advisory.last_updated.strftime("%B %d, %Y")}',
+        self.multi_cell(0, 5, f'Last Updated: {advisory.last_updated.strftime("%B %d, %Y")}',
                         new_x='LMARGIN', new_y='NEXT')
         self.ln(2)
 
-        # Regional warnings (if any elevated regions)
+        # Regional warnings - show all Level 3 (Reconsider Travel) and Level 4 (Do Not Travel) regions
         if advisory.regional_warnings:
-            elevated = [w for w in advisory.regional_warnings if w.level > advisory.overall_level]
-            if elevated:
-                self.set_font('Helvetica', 'B', 9)
-                self.set_text_color(*self.LEVEL_4_COLOR)
-                self.cell(0, 5, 'Elevated Risk Regions:')
-                self.ln(5)
+            high_risk_regions = [w for w in advisory.regional_warnings if w.level >= 3]
+            if high_risk_regions:
+                # Sort by level descending so Level 4 appears first
+                high_risk_regions.sort(key=lambda w: w.level, reverse=True)
 
-                self.set_font('Helvetica', '', 9)
-                for warning in elevated[:5]:  # Limit to 5 regions
-                    self.set_x(10)  # Reset to left margin
-                    self.set_text_color(*self.get_level_color(warning.level))
-                    region_text = f'  - Level {warning.level}: {warning.region_name}'
-                    if warning.reasons:
-                        region_text += f' (due to {warning.reasons})'
-                    # Truncate if too long
-                    if len(region_text) > 100:
-                        region_text = region_text[:97] + '...'
-                    self.multi_cell(0, 4, self._clean_text(region_text))
-                self.ln(3)
+                # Do Not Travel regions
+                level_4_regions = [w for w in high_risk_regions if w.level == 4]
+                if level_4_regions:
+                    self.set_font('Helvetica', 'B', 11)
+                    self.set_text_color(*self.LEVEL_4_COLOR)
+                    self.cell(0, 6, 'Do Not Travel Regions:')
+                    self.ln(6)
 
-        # Summary (truncated)
-        self.set_x(10)  # Reset to left margin
-        self.set_font('Helvetica', '', 9)
-        self.set_text_color(*self.DARK_GRAY)
-        summary = advisory.summary
-        # Truncate long summaries
-        if len(summary) > 500:
-            summary = summary[:497] + '...'
-        self.multi_cell(0, 4, self._clean_text(summary))
+                    self.set_font('Helvetica', '', 11)
+                    for warning in level_4_regions:
+                        self.set_x(15)
+                        self.set_text_color(*self.LEVEL_4_COLOR)
+                        region_text = f'- {warning.region_name}'
+                        if warning.reasons:
+                            region_text += f' (due to {warning.reasons})'
+                        self.multi_cell(0, 5, self._clean_text(region_text),
+                                        new_x='LMARGIN', new_y='NEXT')
+                    self.ln(2)
+
+                # Reconsider Travel regions
+                level_3_regions = [w for w in high_risk_regions if w.level == 3]
+                if level_3_regions:
+                    self.set_font('Helvetica', 'B', 11)
+                    self.set_text_color(*self.LEVEL_3_COLOR)
+                    self.cell(0, 6, 'Reconsider Travel Regions:')
+                    self.ln(6)
+
+                    self.set_font('Helvetica', '', 11)
+                    for warning in level_3_regions:
+                        self.set_x(15)
+                        self.set_text_color(*self.LEVEL_3_COLOR)
+                        region_text = f'- {warning.region_name}'
+                        if warning.reasons:
+                            region_text += f' (due to {warning.reasons})'
+                        self.multi_cell(0, 5, self._clean_text(region_text),
+                                        new_x='LMARGIN', new_y='NEXT')
+                    self.ln(2)
+
+        # Link to full advisory
+        if advisory.link:
+            self.set_font('Helvetica', 'I', 10)
+            self.set_text_color(0, 80, 180)
+            self.set_x(10)
+            self.multi_cell(0, 5, f'Full Advisory: {advisory.link}', align='L',
+                            new_x='LMARGIN', new_y='NEXT')
 
         # Divider
         self.ln(5)
@@ -743,20 +764,20 @@ class TravelAdvisoryPDF(FPDF):
                 continue
 
             # Level header
-            self.set_font('Helvetica', 'B', 11)
+            self.set_font('Helvetica', 'B', 13)
             self.set_text_color(*self.get_level_color(level))
-            self.multi_cell(0, 6, f'Level {level}: {LEVEL_NAMES[level]} ({len(countries)} countries)',
+            self.multi_cell(0, 7, f'Level {level}: {LEVEL_NAMES[level]} ({len(countries)} countries)',
                             new_x='LMARGIN', new_y='NEXT')
 
             # Country list
             self.set_x(10)  # Reset to left margin
-            self.set_font('Helvetica', '', 9)
+            self.set_font('Helvetica', '', 11)
             self.set_text_color(*self.DARK_GRAY)
 
             # Format as comma-separated list
             names = [c.country_name for c in sorted(countries, key=lambda x: x.country_name)]
             text = ', '.join(names)
-            self.multi_cell(0, 4, self._clean_text(text))
+            self.multi_cell(0, 5, self._clean_text(text))
             self.ln(6)
 
 
