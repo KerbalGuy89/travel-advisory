@@ -440,6 +440,236 @@ def filter_high_risk(advisories: list[TravelAdvisory]) -> tuple[list[TravelAdvis
     return prohibited, high_risk
 
 
+# Canonical risk factor keywords, ordered by severity (most severe first).
+# Used by extract_risk_factors() to normalize and prioritize risk descriptions.
+RISK_FACTORS = [
+    "terrorism",
+    "armed conflict",
+    "war",
+    "civil unrest",
+    "kidnapping",
+    "crime",
+    "violent crime",
+    "wrongful detention",
+    "political tension",
+    "piracy",
+    "natural disaster",
+    "health",
+    "maritime",
+    "landmines",
+]
+
+
+def extract_risk_factors(advisory: TravelAdvisory) -> list[str]:
+    """Extract and normalize risk factors from an advisory's regional warnings and summary.
+
+    Parses each RegionalWarning.reasons string and scans advisory.summary for
+    canonical risk factor keywords. Returns a deduplicated list ordered by severity.
+    """
+    found: set[str] = set()
+
+    # Collect raw reason fragments from regional warnings
+    raw_fragments: list[str] = []
+    for warning in advisory.regional_warnings:
+        if warning.reasons:
+            # Split on commas and "and" to get individual reason phrases
+            parts = re.split(r',\s*|\s+and\s+', warning.reasons)
+            raw_fragments.extend(p.strip().lower() for p in parts if p.strip())
+
+    # Match fragments against canonical vocabulary (bidirectional:
+    # "civil unrest" in "widespread civil unrest" AND "unrest" matches "civil unrest")
+    for fragment in raw_fragments:
+        for factor in RISK_FACTORS:
+            if factor in fragment or (len(fragment) > 4 and fragment in factor):
+                found.add(factor)
+
+    # Scan advisory summary for additional canonical keywords
+    summary_lower = (advisory.summary or "").lower()
+    for factor in RISK_FACTORS:
+        if re.search(r'\b' + re.escape(factor) + r'\b', summary_lower):
+            found.add(factor)
+
+    # Also match common short forms to their canonical multi-word factors
+    aliases = {"unrest": "civil unrest", "conflict": "armed conflict",
+               "detention": "wrongful detention"}
+    for alias, factor in aliases.items():
+        if re.search(r'\b' + re.escape(alias) + r'\b', summary_lower):
+            found.add(factor)
+
+    # Return in canonical severity order
+    return [f for f in RISK_FACTORS if f in found]
+
+
+def _extract_guidance_sentence(advisory: TravelAdvisory) -> str | None:
+    """Extract the State Department's core guidance sentence from the summary.
+
+    Looks for "Do not travel to ... due to ...", "Reconsider travel to ... due to ...",
+    or "Exercise increased caution in ... due to ..." patterns.
+    """
+    summary = advisory.summary or ""
+    # Normalize whitespace (summaries contain \n, \xa0, \u202f between words)
+    normalized = re.sub(r'[\s\xa0\u202f]+', ' ', summary)
+    # Protect "U.S." from being treated as a sentence boundary
+    normalized = normalized.replace('U.S.', 'U_S_')
+    # Match the directive + "due to {reasons}" within a single sentence
+    # (use [^.]+ to prevent crossing sentence boundaries)
+    patterns = [
+        r'(Do not travel to [^.]+? due to [^.]+\.)',
+        r'(Reconsider travel to [^.]+? due to [^.]+\.)',
+        r'(Exercise increased caution (?:in|when traveling to) [^.]+? due to [^.]+\.)',
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, normalized, re.IGNORECASE)
+        if match:
+            return match.group(1).replace('U_S_', 'U.S.').strip()
+    return None
+
+
+def _extract_country_context(advisory: TravelAdvisory) -> str | None:
+    """Extract a substantive context sentence from the advisory summary.
+
+    Tries the 'Country Summary:' section first, then falls back to the first
+    sentence in the body that describes on-the-ground conditions.
+    """
+    summary = advisory.summary or ""
+    normalized = re.sub(r'[\s\xa0\u202f]+', ' ', summary)
+    # Protect abbreviations from period-splitting
+    normalized = normalized.replace('U.S.', 'U_S_')
+
+    # Try explicit "Country Summary:" header first
+    match = re.search(r'Country Summary:\s*(.+?)\.', normalized)
+    if match:
+        sentence = match.group(1).replace('U_S_', 'U.S.').strip()
+        # Strip any sub-heading prefix (e.g., "Terrorism: There is risk...")
+        sub_heading = re.match(r'^[A-Z][\w\s]{2,20}:\s+', sentence)
+        if sub_heading:
+            sentence = sentence[sub_heading.end():]
+        if len(sentence) > 20:
+            return sentence + "."
+
+    # Fall back: scan sentences for substantive situational context
+    # Use word stems (leading \b only) so "terrorist", "kidnapping", etc. all match
+    context_keywords = re.compile(
+        r'\b(crime|violen|attack|terror|threat|secur|kidnap|unrest|conflict'
+        r'|gang|cartel|extremis|militia|armed|instab)', re.IGNORECASE
+    )
+    # Protect common abbreviations from period-splitting
+    protected = normalized.replace('U.S.', 'U_S_')
+    # Split on period followed by space+uppercase (sentence boundary)
+    sentences = re.split(r'\.\s+(?=[A-Z])', protected)
+    for sent in sentences:
+        sent = sent.replace('U_S_', 'U.S.').strip()
+        # Must start with uppercase (not a fragment) and be a reasonable length
+        if not sent or not sent[0].isupper():
+            continue
+        if len(sent) < 30 or len(sent) > 200:
+            continue
+        # Skip directives, boilerplate, pronouns, and vague sentences
+        if re.match(r'(Do not travel|Reconsider travel|Exercise increased|Read the'
+                     r'|Some areas|Updated|Visit |There was|If you|They |It |This |These |Those '
+                     r'|Security forces|In some |We |You |The U_S_|Advisory summary)',
+                     sent, re.IGNORECASE):
+            continue
+        # Skip sentences with embedded bullet points or vague area references
+        if ' - ' in sent or 'these areas' in sent.lower():
+            continue
+        # Skip changelog boilerplate (e.g., 'The "unrest" risk indicator was added')
+        if 'risk indicator' in sent.lower() or 'was added' in sent.lower():
+            continue
+        # Strip heading prefixes (e.g., "Terrorism: ...", "Armed conflict ...")
+        # These are section headers followed by body text
+        heading_match = re.match(r'^([A-Z][\w\s]{2,20}):\s+', sent)
+        if heading_match:
+            sent = sent[heading_match.end():]
+            if not sent or len(sent) < 30:
+                continue
+        # Strip known heading phrases that appear without colons
+        # (e.g., "Terrorism Violent extremist...", "Armed conflict Syria has...")
+        heading_phrases = ['Terrorism ', 'Crime ', 'Armed conflict ',
+                           'Civil unrest ', 'Kidnapping ', 'Health ',
+                           'Piracy ', 'Violent crime ']
+        for phrase in heading_phrases:
+            if sent.startswith(phrase) and len(sent) > len(phrase) + 5:
+                rest = sent[len(phrase):]
+                if rest[0].isupper():
+                    sent = rest
+                    break
+        if len(sent) < 30:
+            continue
+        if context_keywords.search(sent):
+            return sent if sent.endswith('.') else sent + "."
+    return None
+
+
+def _format_list(items: list[str]) -> str:
+    """Format a list of strings with commas and 'and'."""
+    if len(items) == 1:
+        return items[0]
+    if len(items) == 2:
+        return f"{items[0]} and {items[1]}"
+    return ", ".join(items[:-1]) + f", and {items[-1]}"
+
+
+def generate_country_summary(advisory: TravelAdvisory) -> str:
+    """Generate a 3-5 sentence summary for a country advisory.
+
+    Combines the advisory level, State Department guidance, regional details
+    with named regions, risk factors, and country context into a readable
+    paragraph. No AI API calls; purely algorithmic.
+    """
+    level_name = LEVEL_NAMES.get(advisory.overall_level, "Unknown")
+    sentences = [
+        f"{advisory.country_name} is rated Level {advisory.overall_level} "
+        f"({level_name}) by the US State Department."
+    ]
+
+    # Guidance sentence extracted from State Dept summary
+    guidance = _extract_guidance_sentence(advisory)
+    if guidance:
+        sentences.append(guidance)
+
+    # Regional clause with named regions (only for countries below Level 4
+    # and only when there are 2+ elevated regions — single-region cases are
+    # already covered by the guidance sentence above)
+    if advisory.overall_level < 4 and advisory.regional_warnings:
+        dnt_regions = [w for w in advisory.regional_warnings if w.level == 4]
+        rt_regions = [w for w in advisory.regional_warnings if w.level == 3]
+        total_elevated = len(dnt_regions) + len(rt_regions)
+        if total_elevated >= 2:
+            if dnt_regions:
+                names = [w.region_name for w in dnt_regions[:4]]
+                text = f"There {'is' if len(dnt_regions) == 1 else 'are'} "
+                text += f"{len(dnt_regions)} Do Not Travel region{'s' if len(dnt_regions) != 1 else ''}"
+                text += f", including {_format_list(names)}"
+                if len(dnt_regions) > 4:
+                    text += f" and {len(dnt_regions) - 4} more"
+                if rt_regions:
+                    text += f", along with {len(rt_regions)} Reconsider Travel region{'s' if len(rt_regions) != 1 else ''}"
+                text += "."
+                sentences.append(text)
+            elif rt_regions:
+                names = [w.region_name for w in rt_regions[:4]]
+                text = f"There {'is' if len(rt_regions) == 1 else 'are'} "
+                text += f"{len(rt_regions)} Reconsider Travel region{'s' if len(rt_regions) != 1 else ''}"
+                text += f", including {_format_list(names)}"
+                if len(rt_regions) > 4:
+                    text += f" and {len(rt_regions) - 4} more"
+                text += "."
+                sentences.append(text)
+
+    # Risk factors clause (cap at 5 to keep the sentence readable)
+    risk_factors = extract_risk_factors(advisory)
+    if risk_factors:
+        sentences.append(f"Key risk factors include {_format_list(risk_factors[:5])}.")
+
+    # Country context from "Country Summary:" section
+    context = _extract_country_context(advisory)
+    if context and len(sentences) < 5:
+        sentences.append(context)
+
+    return " ".join(sentences)
+
+
 class TravelAdvisoryPDF(FPDF):
     """Custom PDF class for travel advisory reports."""
 
@@ -654,8 +884,8 @@ class TravelAdvisoryPDF(FPDF):
 
     def add_advisory_entry(self, advisory: TravelAdvisory):
         """Add a single country advisory entry to the report."""
-        # Check if we need a new page (need at least 60mm for an entry)
-        if self.get_y() > 230:
+        # Check if we need a new page (need at least ~70mm for an entry)
+        if self.get_y() > 220:
             self.add_page()
 
         # Country header bar
@@ -728,6 +958,14 @@ class TravelAdvisoryPDF(FPDF):
                         self.multi_cell(0, 5, self._clean_text(region_text),
                                         new_x='LMARGIN', new_y='NEXT')
                     self.ln(2)
+
+        # Country summary paragraph
+        summary_text = generate_country_summary(advisory)
+        self.set_font('Helvetica', '', 10)
+        self.set_text_color(*self.DARK_GRAY)
+        self.multi_cell(0, 5, self._clean_text(summary_text),
+                        new_x='LMARGIN', new_y='NEXT')
+        self.ln(2)
 
         # Link to full advisory
         if advisory.link:
