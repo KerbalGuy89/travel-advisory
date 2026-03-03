@@ -1286,17 +1286,18 @@ class TravelAdvisoryPDF(FPDF):
         self.ln(8)
 
     # Column widths for the quick-reference table (total = 190mm effective)
-    _TABLE_COL_W = (55, 65, 70)
+    _TABLE_COL_W = (50, 68, 72)
 
     def _summary_table_header(self):
         """Render the column header row for the quick-reference table."""
         col_w = self._TABLE_COL_W
         self.set_font('Helvetica', 'B', 10)
         self.set_fill_color(*self.NAVY)
+        self.set_draw_color(*self.NAVY)
         self.set_text_color(255, 255, 255)
         x0 = self.get_x()
         for label, w in zip(('Country', 'Level', 'Notes'), col_w):
-            self.cell(w, 8, f'  {label}', fill=True)
+            self.cell(w, 8, f'  {label}', border=1, fill=True)
         self.ln(8)
         self.set_x(x0)
 
@@ -1384,22 +1385,25 @@ class TravelAdvisoryPDF(FPDF):
                 fill = False
 
             x0 = self.get_x()
+            self.set_draw_color(*self.LIGHT_GRAY)
 
             # Country name — strip API suffixes like " - See Summaries"
             display_name = re.sub(r'\s*-\s*See\s+Summaries?\s*$', '', adv.country_name)
             self.set_font('Helvetica', '', 10)
             self.set_text_color(*self.DARK_GRAY)
-            self.cell(col_w[0], row_h, f'  {self._clean_text(display_name)}', fill=fill)
+            self.cell(col_w[0], row_h, f'  {self._clean_text(display_name)}',
+                      border='LRB', fill=fill)
 
             # Level label (color-coded)
             self.set_font('Helvetica', 'B', 9)
             self.set_text_color(*color)
-            self.cell(col_w[1], row_h, f'  {label}', fill=fill)
+            self.cell(col_w[1], row_h, f'  {label}', border='LRB', fill=fill)
 
             # Notes
             self.set_font('Helvetica', '', 9)
             self.set_text_color(*self.DARK_GRAY)
-            self.cell(col_w[2], row_h, f'  {self._clean_text(notes)}', fill=fill)
+            self.cell(col_w[2], row_h, f'  {self._clean_text(notes)}',
+                      border='LRB', fill=fill)
 
             self.ln(row_h)
             self.set_x(x0)
