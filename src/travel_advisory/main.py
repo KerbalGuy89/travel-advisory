@@ -142,27 +142,51 @@ class TravelAdvisory:
         return country_code_to_flag(self.country_code)
 
 
-def fetch_advisories() -> list[dict]:
+def _total_summary_length(entries: list[dict]) -> int:
+    """Return the combined length of all Summary fields."""
+    return sum(len(e.get('Summary', '')) for e in entries)
+
+
+def fetch_advisories(max_retries: int = 3) -> list[dict]:
     """Fetch travel advisory data from the State Department API.
+
+    The API occasionally returns truncated Summary fields that omit regional
+    warning details.  To mitigate this, the fetch is retried up to
+    *max_retries* times and the response with the most total summary data is
+    kept.
 
     Returns:
         List of advisory dictionaries from the API.
 
     Raises:
-        ConnectionError: If the API is unavailable.
+        ConnectionError: If all attempts fail.
     """
-    try:
-        req = urllib.request.Request(
-            API_URL,
-            headers={"User-Agent": "TravelAdvisoryReport/1.0"}
-        )
-        with urllib.request.urlopen(req, timeout=30) as response:
-            data = json.loads(response.read().decode('utf-8'))
-            return data if isinstance(data, list) else data.get('data', [])
-    except urllib.error.URLError as e:
-        raise ConnectionError(f"Failed to fetch advisories: {e}")
-    except json.JSONDecodeError as e:
-        raise ConnectionError(f"Invalid API response: {e}")
+    best: list[dict] = []
+    best_size = -1
+    last_error: Exception | None = None
+
+    for attempt in range(max_retries):
+        try:
+            req = urllib.request.Request(
+                API_URL,
+                headers={"User-Agent": "TravelAdvisoryReport/1.0"}
+            )
+            with urllib.request.urlopen(req, timeout=30) as response:
+                data = json.loads(response.read().decode('utf-8'))
+                entries = data if isinstance(data, list) else data.get('data', [])
+                size = _total_summary_length(entries)
+                if size > best_size:
+                    best, best_size = entries, size
+                    logger.debug("Fetch attempt %d: %d entries, %d total summary chars",
+                                 attempt + 1, len(entries), size)
+        except (urllib.error.URLError, json.JSONDecodeError, OSError) as e:
+            last_error = e
+            logger.debug("Fetch attempt %d failed: %s", attempt + 1, e)
+
+    if not best:
+        raise ConnectionError(f"Failed to fetch advisories after {max_retries} attempts: {last_error}")
+
+    return best
 
 
 def parse_level_from_title(title: str) -> tuple[str, int]:
@@ -191,10 +215,107 @@ def clean_html(text: str) -> str:
     text = re.sub(r'</p>', '\n', text, flags=re.IGNORECASE)
     text = re.sub(r'<li[^>]*>', '\n- ', text, flags=re.IGNORECASE)
     text = re.sub(r'<[^>]+>', '', text)
+    # Normalize non-breaking and narrow no-break spaces to regular spaces
+    text = re.sub(r'[\xa0\u202f]', ' ', text)
     # Clean up whitespace
     text = re.sub(r'\n{3,}', '\n\n', text)
     text = re.sub(r' +', ' ', text)
     return text.strip()
+
+
+def _resolve_region_from_context(clean_text: str, match_start: int) -> str | None:
+    """When the regex captures 'this area', look backwards for a header line.
+
+    State Dept advisories use a consistent pattern where the region name
+    appears as a header on the line(s) preceding the warning directive:
+
+        Union territory of Jammu and Kashmir:
+        Do not travel to this area ...
+
+        India-Pakistan Border
+        Do not travel to this area ...
+
+    This function walks backwards from the match position to find that header.
+    """
+    # Get all text before the match
+    preceding = clean_text[:match_start]
+    # Split into lines and walk backwards past blank lines
+    lines = preceding.split('\n')
+    for line in reversed(lines):
+        line = line.strip()
+        if not line or line.startswith('-'):
+            continue
+        # Strip trailing colons and punctuation used in headers
+        header = re.sub(r'[:\s]+$', '', line).strip()
+        # Reject if it looks like boilerplate or a section label
+        boilerplate = [
+            'country summary', 'if you decide', 'travel advisory',
+            'read the', 'visit our', 'review', 'enroll', 'prepare',
+            'we highly', 'check with', 'permission is not',
+            'do not travel', 'reconsider travel', 'exercise increased',
+            'exercise normal', 'check the', 'consult', 'safety and security',
+            'website for', 'see the',
+        ]
+        if any(bp in header.lower() for bp in boilerplate):
+            return None
+        # Reject "Level N" section labels (e.g. "Level 4: Do Not Travel")
+        if re.match(r'^Level\s+\d', header, re.IGNORECASE):
+            return None
+        if len(header) < 3 or len(header) > 200:
+            return None
+        # Remove leading articles
+        header = re.sub(r'^(the|a|an)\s+', '', header, flags=re.IGNORECASE).strip()
+        return header
+    return None
+
+
+def _expand_bullet_warnings(text: str) -> str:
+    """Expand bullet-list warning formats into standalone sentences.
+
+    Converts patterns like:
+        Do Not Travel to:
+        - Region A due to X.
+        - Region B due to Y.
+
+    Into:
+        Do not travel to Region A due to X.
+        Do not travel to Region B due to Y.
+
+    This normalizes all formats before the main regex runs.
+    """
+    lines = text.split('\n')
+    result = []
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        # Check for directive ending with colon and no region after it
+        directive_match = re.match(
+            r'(Do\s+Not\s+Travel\s+to|Reconsider\s+Travel\s+to)\s*:\s*$',
+            line, re.IGNORECASE
+        )
+        if directive_match:
+            directive = directive_match.group(1)
+            i += 1
+            # Collect subsequent bullet lines
+            while i < len(lines):
+                bullet_line = lines[i].strip()
+                if bullet_line.startswith('- ') or bullet_line.startswith('* '):
+                    content = bullet_line[2:].strip()
+                    # Synthesize a standalone sentence
+                    sentence = f"{directive} {content}"
+                    if not sentence.endswith('.'):
+                        sentence += '.'
+                    result.append(sentence)
+                    i += 1
+                elif not bullet_line:
+                    i += 1
+                    break
+                else:
+                    break
+        else:
+            result.append(lines[i])
+            i += 1
+    return '\n'.join(result)
 
 
 def extract_regional_warnings(summary: str, overall_level: int) -> list[RegionalWarning]:
@@ -205,6 +326,9 @@ def extract_regional_warnings(summary: str, overall_level: int) -> list[Regional
     - "Do not travel to X due to Y"
     - "Reconsider travel to X"
 
+    When the matched region is a vague reference like "this area", falls back
+    to the preceding header line to resolve the actual region name.
+
     Args:
         summary: The advisory summary HTML/text.
         overall_level: The country's overall advisory level.
@@ -214,20 +338,30 @@ def extract_regional_warnings(summary: str, overall_level: int) -> list[Regional
     """
     warnings = []
     clean_text = clean_html(summary)
+    clean_text = _expand_bullet_warnings(clean_text)
+
+    vague_terms = [
+        'these areas', 'this area', 'the area', 'certain areas',
+        'following areas', 'following locations', 'following regions',
+        'the following', 'areas below', 'locations below',
+    ]
+    skip_phrases = ['country', 'nation', 'all of', 'anywhere', 'entire']
 
     # Pattern 1: "Do not travel to X due to Y" (implies Level 4)
     # This is the most reliable pattern in State Dept advisories
     if overall_level < 4:
         do_not_travel = re.finditer(
-            r'[Dd]o\s+not\s+travel\s+to[:\s]+(.+?)\s+due\s+to\s+([^.]+)',
-            clean_text
+            r'Do\s+not\s+travel\s+to[:\s]+(.+?)\s+(?:due\s+to|for\s+any\s+reason[,.]?\s*(?:due\s+to)?)\s*([^.]*?)\.',
+            clean_text,
+            re.IGNORECASE
         )
         for match in do_not_travel:
             region = match.group(1).strip()
             reasons = match.group(2).strip()
+            if not reasons:
+                reasons = "unspecified"
 
             # Skip country-wide statements
-            skip_phrases = ['country', 'nation', 'all of', 'anywhere', 'entire']
             if any(skip in region.lower() for skip in skip_phrases):
                 continue
 
@@ -236,16 +370,21 @@ def extract_regional_warnings(summary: str, overall_level: int) -> list[Regional
             region = re.sub(r'^[-:*]\s*', '', region)  # Remove leading punctuation
             region = region.strip()
 
-            # Skip vague references
-            vague_terms = ['these areas', 'this area', 'the area', 'certain areas']
+            # When the match is a vague reference like "this area", resolve the
+            # actual region name from the preceding header line
             if any(vague in region.lower() for vague in vague_terms):
-                continue
+                resolved = _resolve_region_from_context(clean_text, match.start())
+                if resolved:
+                    region = resolved
+                else:
+                    continue
 
             if len(region) < 3 or len(region) > 200:
                 continue
 
             # Avoid duplicates
-            if not any(region.lower() in w.region_name.lower() for w in warnings):
+            if not any(region.lower() in w.region_name.lower() or
+                       w.region_name.lower() in region.lower() for w in warnings):
                 warnings.append(RegionalWarning(
                     region_name=region,
                     level=4,
@@ -255,15 +394,17 @@ def extract_regional_warnings(summary: str, overall_level: int) -> list[Regional
     # Pattern 2: "Reconsider travel to X due to Y" (implies Level 3)
     if overall_level < 3:
         reconsider = re.finditer(
-            r'[Rr]econsider\s+travel\s+to[:\s]+(.+?)\s+due\s+to\s+([^.]+)',
-            clean_text
+            r'Reconsider\s+travel\s+to[:\s]+(.+?)\s+(?:due\s+to|for\s+any\s+reason[,.]?\s*(?:due\s+to)?)\s*([^.]*?)\.',
+            clean_text,
+            re.IGNORECASE
         )
         for match in reconsider:
             region = match.group(1).strip()
             reasons = match.group(2).strip()
+            if not reasons:
+                reasons = "unspecified"
 
             # Skip country-wide statements
-            skip_phrases = ['country', 'nation', 'all of', 'anywhere', 'entire']
             if any(skip in region.lower() for skip in skip_phrases):
                 continue
 
@@ -271,15 +412,19 @@ def extract_regional_warnings(summary: str, overall_level: int) -> list[Regional
             region = re.sub(r'^[-:*]\s*', '', region)
             region = region.strip()
 
-            # Skip vague references
-            vague_terms = ['these areas', 'this area', 'the area', 'certain areas']
+            # Resolve vague references from preceding header line
             if any(vague in region.lower() for vague in vague_terms):
-                continue
+                resolved = _resolve_region_from_context(clean_text, match.start())
+                if resolved:
+                    region = resolved
+                else:
+                    continue
 
             if len(region) < 3 or len(region) > 200:
                 continue
 
-            if not any(region.lower() in w.region_name.lower() for w in warnings):
+            if not any(region.lower() in w.region_name.lower() or
+                       w.region_name.lower() in region.lower() for w in warnings):
                 warnings.append(RegionalWarning(
                     region_name=region,
                     level=3,
@@ -289,14 +434,159 @@ def extract_regional_warnings(summary: str, overall_level: int) -> list[Regional
     return warnings
 
 
-def parse_advisory(raw: dict) -> TravelAdvisory | None:
+def _has_regional_signals(summary: str) -> bool:
+    """Detect whether a summary likely contains regional warning data.
+
+    Returns True if the summary text has phrases that typically indicate
+    sub-national risk levels, even when the regex extraction fails to
+    capture them (e.g. because the data is in a non-standard format).
+    """
+    signals = [
+        r'some\s+areas\s+have\s+increased\s+risk',
+        r'level\s+[34]',
+        r'do\s+not\s+travel',
+        r'reconsider\s+travel',
+        r'high-risk\s+areas',
+        r'restricted\s+areas',
+        r'not\s+allowed\s+to\s+travel',
+    ]
+    text = summary.lower()
+    return any(re.search(s, text) for s in signals)
+
+
+def fetch_advisory_page(url: str) -> str:
+    """Fetch the full advisory HTML page from travel.state.gov.
+
+    Returns the raw HTML string, or empty string on failure.
+    Non-fatal: logs a warning on failure so the pipeline continues.
+    """
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "TravelAdvisoryReport/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as response:
+            return response.read().decode('utf-8', errors='replace')
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        logger.warning("Failed to fetch advisory page %s: %s", url, e)
+        return ""
+
+
+def extract_regional_warnings_from_page(
+    page_html: str, overall_level: int
+) -> list[RegionalWarning]:
+    """Extract regional warnings from a full advisory HTML page.
+
+    Advisory pages use several formats:
+    1. "Region - Level N: Do Not Travel" (inline)
+    2. Level header followed by region names on subsequent lines:
+         Level: 4 - Do not travel
+         State of Colima
+         Do not travel due to terrorism, crime...
+
+    This is far more reliable than the API Summary field for countries
+    like Mexico where the summary omits regional detail.
+    """
+    warnings = []
+    clean_text = clean_html(page_html)
+
+    # Pattern 1: "Region Name - Level N: Do Not Travel" (inline format)
+    structured = re.finditer(
+        r'([A-Z][A-Za-z\s\'-]+?)\s*[-\u2013\u2014]\s*Level\s+(\d)\s*:\s*(Do\s+Not\s+Travel|Reconsider\s+Travel)',
+        clean_text
+    )
+    for match in structured:
+        region = match.group(1).strip()
+        level = int(match.group(2))
+
+        if level <= overall_level:
+            continue
+        if region.lower() in ('country summary', 'last update', 'advisory'):
+            continue
+        if len(region) < 3 or len(region) > 200:
+            continue
+
+        after_match = clean_text[match.end():]
+        reasons = ""
+        paren = re.match(r'\s*\(([^)]+)\)', after_match)
+        if paren:
+            reasons = paren.group(1).strip()
+
+        if not any(region.lower() == w.region_name.lower() for w in warnings):
+            warnings.append(RegionalWarning(
+                region_name=region,
+                level=level,
+                reasons=reasons
+            ))
+
+    # Pattern 2: Level header sections with region names on following lines
+    # e.g. "Level: 4 - Do not travel" followed by region-name lines
+    if not warnings:
+        # Split into sections by level headers
+        level_sections = re.split(
+            r'Level\s*:\s*(\d)\s*-\s*(Do\s+Not\s+Travel|Reconsider\s+Travel)',
+            clean_text, flags=re.IGNORECASE
+        )
+        # level_sections: [preamble, level_num, directive, section_text, level_num, ...]
+        i = 1
+        while i + 2 < len(level_sections):
+            level = int(level_sections[i])
+            section_text = level_sections[i + 2]
+            i += 3
+
+            if level <= overall_level:
+                continue
+
+            # Find region names: lines that look like headers (capitalized,
+            # no directive keywords) followed by a directive line
+            lines = section_text.split('\n')
+            for j, line in enumerate(lines):
+                line = line.strip()
+                if not line:
+                    continue
+                # A region name line is typically a short capitalized phrase
+                # that is NOT a directive or boilerplate
+                if re.match(r'^(Do\s+not\s+travel|Reconsider\s+travel|Exercise|Read\s+the|Visit|If\s+you|There\s+|Most\s+|Shooting|U\.S\.|Check|Expand|Collapse)', line, re.IGNORECASE):
+                    continue
+                if line.startswith('- ') or line.startswith('* '):
+                    continue
+                # Must start with uppercase and be reasonably short (region name)
+                if not line[0].isupper() or len(line) > 100:
+                    continue
+                # Check that the next non-empty line is a directive
+                next_line = ""
+                for k in range(j + 1, min(j + 4, len(lines))):
+                    nl = lines[k].strip()
+                    if nl:
+                        next_line = nl
+                        break
+                if re.match(r'(Do\s+not\s+travel|Reconsider\s+travel)', next_line, re.IGNORECASE):
+                    # Extract reasons from the directive line
+                    reasons_match = re.search(r'due\s+to\s+([^.]+)', next_line, re.IGNORECASE)
+                    reasons = reasons_match.group(1).strip() if reasons_match else ""
+                    region = line.strip()
+                    if len(region) >= 3 and not any(region.lower() == w.region_name.lower() for w in warnings):
+                        warnings.append(RegionalWarning(
+                            region_name=region,
+                            level=level,
+                            reasons=reasons
+                        ))
+
+    # Fallback: try the same regex patterns used for summary text
+    if not warnings:
+        warnings = extract_regional_warnings(page_html, overall_level)
+
+    return warnings
+
+
+def parse_advisory(raw: dict) -> tuple[TravelAdvisory | None, bool]:
     """Parse a raw API response into a TravelAdvisory object.
 
     Args:
         raw: Dictionary from the API response.
 
     Returns:
-        TravelAdvisory object or None if parsing fails.
+        Tuple of (TravelAdvisory or None, page_fallback_used).
     """
     try:
         title = raw.get('Title', '')
@@ -310,7 +600,7 @@ def parse_advisory(raw: dict) -> TravelAdvisory | None:
                 logger.info("Keeping level-0 prohibited entry: %s", title)
             else:
                 logger.warning("Skipping unparseable advisory (no level): %s", title)
-                return None
+                return None, False
 
         # Get country code from Category field (usually a list like ["MX"])
         category = raw.get('Category', [])
@@ -330,6 +620,19 @@ def parse_advisory(raw: dict) -> TravelAdvisory | None:
         # Extract regional warnings
         regional_warnings = extract_regional_warnings(summary, overall_level)
 
+        # Page scraping fallback: for countries where the API Summary hints
+        # at regional warnings but the regex failed to extract any, fetch
+        # the full advisory page for more reliable structured data.
+        page_fallback_used = False
+        if overall_level <= 2 and not regional_warnings and _has_regional_signals(summary):
+            page_html = fetch_advisory_page(link)
+            if page_html:
+                regional_warnings = extract_regional_warnings_from_page(page_html, overall_level)
+                if regional_warnings:
+                    page_fallback_used = True
+                    logger.info("Recovered %d regional warnings from page for %s",
+                                len(regional_warnings), country_name)
+
         return TravelAdvisory(
             country_name=country_name,
             country_code=country_code,
@@ -338,10 +641,10 @@ def parse_advisory(raw: dict) -> TravelAdvisory | None:
             last_updated=last_updated,
             link=link,
             regional_warnings=regional_warnings
-        )
+        ), page_fallback_used
     except Exception as e:
         logger.error("Failed to parse advisory '%s': %s", raw.get('Title', '<no title>'), e)
-        return None
+        return None, False
 
 
 def is_prohibited_country(country_name: str) -> bool:
@@ -1092,6 +1395,8 @@ class VerificationReport:
         self.high_risk_names: list[str] = []
         self.data_hash: str = ""
         self.assertion_errors: list[str] = []
+        self.regional_signal_gaps: list[str] = []    # countries with signals but no warnings
+        self.page_fallback_used: list[str] = []      # countries where page scraping was used
 
     def compute_data_hash(self, advisories: list[TravelAdvisory]) -> str:
         """Compute a SHA-256 fingerprint of the processed advisory data."""
@@ -1125,7 +1430,12 @@ class VerificationReport:
             else:
                 self.regional_countries.append(adv.country_name)
 
-    def run_assertions(self, prohibited: list[TravelAdvisory], high_risk: list[TravelAdvisory]) -> bool:
+    def run_assertions(
+        self,
+        prohibited: list[TravelAdvisory],
+        high_risk: list[TravelAdvisory],
+        all_advisories: list[TravelAdvisory] | None = None,
+    ) -> bool:
         """Run verification assertions. Returns True if all pass."""
         self.assertion_errors = []
 
@@ -1156,6 +1466,19 @@ class VerificationReport:
             if code in seen_codes:
                 self.assertion_errors.append(f"DUPLICATE: Country code '{code}' appears more than once")
             seen_codes.add(code)
+
+        # 5. Flag unresolved regional signal gaps (warning, not a hard failure)
+        if all_advisories:
+            for adv in all_advisories:
+                if adv.overall_level <= 2 and not adv.regional_warnings:
+                    if _has_regional_signals(adv.summary):
+                        self.regional_signal_gaps.append(adv.country_name)
+            if self.regional_signal_gaps:
+                logger.warning(
+                    "Regional signal gaps (%d countries have signals but no extracted warnings): %s",
+                    len(self.regional_signal_gaps),
+                    ", ".join(self.regional_signal_gaps)
+                )
 
         return len(self.assertion_errors) == 0
 
@@ -1206,6 +1529,22 @@ class VerificationReport:
         lines.append(f"Regional warnings (L1/L2):     {len(self.regional_countries)}")
         for name in sorted(self.regional_countries):
             lines.append(f"  - {name}")
+
+        # Page fallback usage
+        if self.page_fallback_used:
+            lines.append("")
+            lines.append("--- PAGE SCRAPING FALLBACK ---")
+            lines.append(f"Countries using page fallback: {len(self.page_fallback_used)}")
+            for name in sorted(self.page_fallback_used):
+                lines.append(f"  - {name}")
+
+        # Unresolved regional signal gaps
+        if self.regional_signal_gaps:
+            lines.append("")
+            lines.append("--- REGIONAL SIGNAL GAPS (warnings) ---")
+            lines.append(f"Countries with regional signals but no extracted warnings: {len(self.regional_signal_gaps)}")
+            for name in sorted(self.regional_signal_gaps):
+                lines.append(f"  [WARN] {name}")
 
         # Data hash
         lines.append("")
@@ -1270,9 +1609,11 @@ def main():
     print("Parsing advisory data...")
     advisories = []
     for raw in raw_data:
-        parsed = parse_advisory(raw)
+        parsed, used_fallback = parse_advisory(raw)
         if parsed:
             advisories.append(parsed)
+            if used_fallback:
+                verification.page_fallback_used.append(parsed.country_name)
         else:
             verification.parse_failures += 1
             verification.failed_titles.append(raw.get('Title', '<no title>'))
@@ -1310,7 +1651,7 @@ def main():
     print(f"  - Level 1/2 with regional warnings: {len(regional)}")
 
     # Run verification assertions
-    assertions_passed = verification.run_assertions(prohibited, high_risk)
+    assertions_passed = verification.run_assertions(prohibited, high_risk, all_advisories=advisories)
 
     if args.list_only:
         print("\n" + "=" * 60)
