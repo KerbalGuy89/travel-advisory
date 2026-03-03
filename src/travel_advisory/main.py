@@ -1385,28 +1385,39 @@ class TravelAdvisoryPDF(FPDF):
                 fill = False
 
             x0 = self.get_x()
+            y0 = self.get_y()
             self.set_draw_color(*self.LIGHT_GRAY)
 
             # Country name — strip API suffixes like " - See Summaries"
             display_name = re.sub(r'\s*-\s*See\s+Summaries?\s*$', '', adv.country_name)
-            self.set_font('Helvetica', '', 10)
-            self.set_text_color(*self.DARK_GRAY)
-            self.cell(col_w[0], row_h, f'  {self._clean_text(display_name)}',
-                      border='LRB', fill=fill)
+            name_text = f'  {self._clean_text(display_name)}'
 
-            # Level label (color-coded)
+            # Measure how many lines the country name needs (dry run)
+            self.set_font('Helvetica', '', 10)
+            lines = self.multi_cell(col_w[0], row_h, name_text,
+                                    dry_run=True, output='LINES')
+            actual_h = max(len(lines), 1) * row_h
+
+            # Draw country cell (wraps long names)
+            self.set_xy(x0, y0)
+            self.set_text_color(*self.DARK_GRAY)
+            self.multi_cell(col_w[0], row_h, name_text,
+                            border='LR', fill=fill, new_x='RIGHT', new_y='TOP')
+
+            # Level label (color-coded) — height matches country cell
             self.set_font('Helvetica', 'B', 9)
             self.set_text_color(*color)
-            self.cell(col_w[1], row_h, f'  {label}', border='LRB', fill=fill)
+            self.cell(col_w[1], actual_h, f'  {label}', border='LR', fill=fill)
 
             # Notes
             self.set_font('Helvetica', '', 9)
             self.set_text_color(*self.DARK_GRAY)
-            self.cell(col_w[2], row_h, f'  {self._clean_text(notes)}',
-                      border='LRB', fill=fill)
+            self.cell(col_w[2], actual_h, f'  {self._clean_text(notes)}',
+                      border='LR', fill=fill)
 
-            self.ln(row_h)
-            self.set_x(x0)
+            # Bottom border across all columns
+            self.set_xy(x0, y0 + actual_h)
+            self.line(x0, y0 + actual_h, x0 + sum(col_w), y0 + actual_h)
 
         # Footnote
         self.ln(6)
