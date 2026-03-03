@@ -1285,41 +1285,149 @@ class TravelAdvisoryPDF(FPDF):
         self.line(10, self.get_y(), self.epw + 10, self.get_y())
         self.ln(8)
 
-    def add_summary_section(self, advisories: list[TravelAdvisory]):
-        """Add a summary section listing all countries by level."""
+    # Column widths for the quick-reference table (total = 190mm effective)
+    _TABLE_COL_W = (55, 65, 70)
+
+    def _summary_table_header(self):
+        """Render the column header row for the quick-reference table."""
+        col_w = self._TABLE_COL_W
+        self.set_font('Helvetica', 'B', 10)
+        self.set_fill_color(*self.NAVY)
+        self.set_text_color(255, 255, 255)
+        x0 = self.get_x()
+        for label, w in zip(('Country', 'Level', 'Notes'), col_w):
+            self.cell(w, 8, f'  {label}', fill=True)
+        self.ln(8)
+        self.set_x(x0)
+
+    def add_summary_section(
+        self,
+        prohibited: list[TravelAdvisory],
+        advisories: list[TravelAdvisory],
+    ):
+        """Add a unified quick-reference table of all countries in the report.
+
+        Prohibited countries appear first, followed by Level 4, Level 3, then
+        countries with regional warnings (Level 2/1), each sorted alphabetically.
+        """
         self.add_page()
 
+        # Section title
         self.set_font('Helvetica', 'B', 16)
         self.set_text_color(*self.NAVY)
         self.cell(0, 10, 'Quick Reference - Countries by Risk Level', align='C')
-        self.ln(15)
+        self.ln(12)
 
-        # Group by overall level
-        by_level = {4: [], 3: [], 2: [], 1: []}
-        for adv in advisories:
-            by_level[adv.overall_level].append(adv)
+        # Build sorted row list: (advisory, label, color, notes)
+        rows: list[tuple[TravelAdvisory, str, tuple, str]] = []
 
-        for level in [4, 3, 2, 1]:
-            countries = by_level[level]
-            if not countries:
-                continue
+        # Prohibited countries first (alphabetical)
+        for adv in sorted(prohibited, key=lambda a: a.country_name):
+            rows.append((adv, 'PROHIBITED', self.PROHIBITED_COLOR, 'EO GA-48'))
 
-            # Level header
-            self.set_font('Helvetica', 'B', 13)
-            self.set_text_color(*self.get_level_color(level))
-            self.multi_cell(0, 7, f'Level {level}: {LEVEL_NAMES[level]} ({len(countries)} countries)',
-                            new_x='LMARGIN', new_y='NEXT')
+        # Level 4 countries
+        l4 = sorted(
+            [a for a in advisories if a.overall_level == 4],
+            key=lambda a: a.country_name,
+        )
+        for adv in l4:
+            rows.append((adv, '4 - Do Not Travel', self.LEVEL_4_COLOR, ''))
 
-            # Country list
-            self.set_x(10)  # Reset to left margin
-            self.set_font('Helvetica', '', 11)
+        # Level 3 countries
+        l3 = sorted(
+            [a for a in advisories if a.overall_level == 3],
+            key=lambda a: a.country_name,
+        )
+        for adv in l3:
+            rows.append((adv, '3 - Reconsider Travel', self.LEVEL_3_COLOR, ''))
+
+        # Level 2 with regional warnings
+        l2_regional = sorted(
+            [a for a in advisories if a.overall_level == 2 and a.has_regional_elevation],
+            key=lambda a: a.country_name,
+        )
+        for adv in l2_regional:
+            notes = self._regional_notes(adv)
+            rows.append((adv, '2 - Increased Caution', self.LEVEL_2_COLOR, notes))
+
+        # Level 1 with regional warnings
+        l1_regional = sorted(
+            [a for a in advisories if a.overall_level == 1 and a.has_regional_elevation],
+            key=lambda a: a.country_name,
+        )
+        for adv in l1_regional:
+            notes = self._regional_notes(adv)
+            rows.append((adv, '1 - Normal Precautions', self.LEVEL_1_COLOR, notes))
+
+        col_w = self._TABLE_COL_W
+        row_h = 7
+
+        # Draw table header
+        self._summary_table_header()
+
+        # Draw rows
+        for idx, (adv, label, color, notes) in enumerate(rows):
+            # Page break check — leave room for row + footnote
+            if self.get_y() + row_h > self.h - self.b_margin - 20:
+                self.add_page()
+                self.set_font('Helvetica', 'B', 14)
+                self.set_text_color(*self.NAVY)
+                self.cell(0, 10, 'Quick Reference (continued)', align='C')
+                self.ln(10)
+                self._summary_table_header()
+
+            # Alternating row background
+            if idx % 2 == 1:
+                self.set_fill_color(*self.LIGHT_GRAY)
+                fill = True
+            else:
+                fill = False
+
+            x0 = self.get_x()
+
+            # Country name — strip API suffixes like " - See Summaries"
+            display_name = re.sub(r'\s*-\s*See\s+Summaries?\s*$', '', adv.country_name)
+            self.set_font('Helvetica', '', 10)
             self.set_text_color(*self.DARK_GRAY)
+            self.cell(col_w[0], row_h, f'  {self._clean_text(display_name)}', fill=fill)
 
-            # Format as comma-separated list
-            names = [c.country_name for c in sorted(countries, key=lambda x: x.country_name)]
-            text = ', '.join(names)
-            self.multi_cell(0, 5, self._clean_text(text))
-            self.ln(6)
+            # Level label (color-coded)
+            self.set_font('Helvetica', 'B', 9)
+            self.set_text_color(*color)
+            self.cell(col_w[1], row_h, f'  {label}', fill=fill)
+
+            # Notes
+            self.set_font('Helvetica', '', 9)
+            self.set_text_color(*self.DARK_GRAY)
+            self.cell(col_w[2], row_h, f'  {self._clean_text(notes)}', fill=fill)
+
+            self.ln(row_h)
+            self.set_x(x0)
+
+        # Footnote
+        self.ln(6)
+        self.set_draw_color(*self.LIGHT_GRAY)
+        self.line(10, self.get_y(), self.epw + 10, self.get_y())
+        self.ln(4)
+        self.set_font('Helvetica', 'I', 8)
+        self.set_text_color(*self.MEDIUM_GRAY)
+        self.multi_cell(0, 4, self._clean_text(
+            'EO GA-48: Texas Executive Order GA-48 (Nov 2024) prohibits state employee '
+            'work-related travel to countries designated as foreign adversaries per 15 CFR 791.4.\n'
+            'DNT = Do Not Travel (Level 4 regions)  |  RT = Reconsider Travel (Level 3 regions)'
+        ), align='L')
+
+    @staticmethod
+    def _regional_notes(adv: TravelAdvisory) -> str:
+        """Build a short notes string describing regional warning counts."""
+        dnt = sum(1 for w in adv.regional_warnings if w.level == 4)
+        rt = sum(1 for w in adv.regional_warnings if w.level == 3)
+        parts = []
+        if dnt:
+            parts.append(f'{dnt} DNT region{"s" if dnt != 1 else ""}')
+        if rt:
+            parts.append(f'{rt} RT region{"s" if rt != 1 else ""}')
+        return ', '.join(parts)
 
 
 def create_report(
@@ -1351,11 +1459,8 @@ def create_report(
     # Title page with statistics
     pdf.add_title_page(stats)
 
-    # PROHIBITED COUNTRIES SECTION - Must appear first
-    pdf.add_prohibited_section(prohibited)
-
-    # Quick reference summary (high-risk only, excludes prohibited)
-    pdf.add_summary_section(advisories)
+    # Unified quick-reference table (prohibited + high-risk)
+    pdf.add_summary_section(prohibited, advisories)
 
     # Detailed entries - Level 4 first
     pdf.add_page()
