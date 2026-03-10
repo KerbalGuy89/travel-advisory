@@ -792,15 +792,25 @@ def is_prohibited_country(country_name: str) -> bool:
 def _match_country_dict(country_name: str, country_dict: dict) -> bool:
     """Check if a country name matches any entry in a country dictionary.
 
-    Matches against canonical key names and all entries in 'includes' lists,
-    using case-insensitive substring matching in both directions.
+    Matching strategy (all case-insensitive):
+    1. Word-boundary regex on the dict key — prevents short names like "Oman"
+       from falsely matching longer names like "Romania".
+    2. Substring match on official_name — catches cases where the API uses the
+       full official name (e.g. "United Arab Emirates" for key "UAE").
+    3. Word-boundary regex on each entry in the 'includes' list.
     """
     name_lower = country_name.lower().strip()
     for key, info in country_dict.items():
-        if key.lower() in name_lower or name_lower in key.lower():
+        # 1. Word-boundary match on canonical key name
+        if re.search(r'\b' + re.escape(key.lower()) + r'\b', name_lower):
             return True
-        for alias in info.get("includes", []):
-            if alias.lower() in name_lower or name_lower in alias.lower():
+        # 2. Official name substring match (handles abbreviations like UAE)
+        official = info.get('official_name', '').lower()
+        if official and official in name_lower:
+            return True
+        # 3. Word-boundary match on includes aliases
+        for alias in info.get('includes', []):
+            if re.search(r'\b' + re.escape(alias.lower()) + r'\b', name_lower):
                 return True
     return False
 
@@ -2083,10 +2093,23 @@ def main():
     print(f"\nUT System suspended travel: {len(ut_suspended)}")
     for adv in ut_suspended:
         print(f"  - {adv.country_name}")
+    _ut_unmatched = [
+        n for n in UT_SUSPENDED_TRAVEL
+        if not is_prohibited_country(n)
+        and not any(n.lower() in a.country_name.lower() for a in ut_suspended)
+    ]
+    if _ut_unmatched:
+        print(f"  [WARN] No API entry found for: {', '.join(_ut_unmatched)}")
 
     print(f"\nRestricted / elevated approval required: {len(restricted_special)}")
     for adv in restricted_special:
         print(f"  - {adv.country_name}")
+    _re_unmatched = [
+        n for n in RESTRICTED_TRAVEL_REQUIRING_SPECIAL_APPROVAL
+        if not any(n.lower() in a.country_name.lower() for a in restricted_special)
+    ]
+    if _re_unmatched:
+        print(f"  [WARN] No API entry found for: {', '.join(_re_unmatched)}")
 
     print(f"\nFound {len(high_risk)} additional high-risk destinations:")
     level_4 = [a for a in high_risk if a.overall_level == 4]
