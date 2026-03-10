@@ -94,9 +94,10 @@ PROHIBITED_COUNTRY_NAMES = {
 # =============================================================================
 # UT SUSPENDED TRAVEL - UT System Travel Suspension
 # =============================================================================
-# Travel to these countries is suspended by the UT System. Exceptions require
-# approval from both the International Office Coordinator (IOC) and the
-# University President.
+# Travel to these countries is suspended by the UT System. This applies to
+# travel to or through these countries, including layovers and connections.
+# Exceptions require approval from both the Institutional Oversight Committee
+# (IOC) and the University President.
 #
 # Note: Iran and Russia also appear in PROHIBITED_COUNTRIES. The filter
 # waterfall places them in the prohibited bucket first; they will never reach
@@ -190,7 +191,9 @@ UT_SUSPENDED_TRAVEL = {
 # RESTRICTED TRAVEL REQUIRING SPECIAL APPROVAL - UT System Elevated Approval
 # =============================================================================
 # Travel to these countries is not suspended but requires elevated approval
-# from both the IOC and the University President before booking.
+# from both the Institutional Oversight Committee (IOC) and the University
+# President before booking. Applies to travel to or through these countries,
+# including layovers and connections.
 # =============================================================================
 
 RESTRICTED_TRAVEL_REQUIRING_SPECIAL_APPROVAL = {
@@ -808,7 +811,7 @@ def is_ut_suspended_country(country_name: str) -> bool:
 
 
 def is_restricted_special_country(country_name: str) -> bool:
-    """Check if a country requires IOC + President elevated approval."""
+    """Check if a country requires Institutional Oversight Committee (IOC) + President elevated approval."""
     return _match_country_dict(country_name, RESTRICTED_TRAVEL_REQUIRING_SPECIAL_APPROVAL)
 
 
@@ -857,8 +860,8 @@ def filter_high_risk(
 
     Waterfall priority (first match wins):
       1. Prohibited       — Texas EO GA-48 foreign adversaries
-      2. UT Suspended     — UT System suspended travel (IOC + President exception required)
-      3. Restricted       — UT System elevated approval required (IOC + President)
+      2. UT Suspended     — UT System suspended travel (IOC + President exception required; incl. layovers)
+      3. Restricted       — UT System elevated approval required (IOC + President; incl. layovers)
       4. High-risk        — Level 3/4 or Level 1/2 with regional Level 3/4 warnings
 
     Args:
@@ -1491,12 +1494,13 @@ class TravelAdvisoryPDF(FPDF):
              'designating these countries as foreign adversaries.'),
             (self.UT_SUSPENDED_COLOR,
              'UT SUSPENDED:',
-             'UT System travel is suspended; exceptions require approval from both '
-             'the International Office Coordinator (IOC) and the University President.'),
+             'UT System travel is suspended to or through these countries, including layovers '
+             'and connections. Exceptions require approval from both the Institutional Oversight '
+             'Committee (IOC) and the University President.'),
             (self.RESTRICTED_SPECIAL_COLOR,
              'RESTRICTED - ELEVATED APPROVAL:',
-             'Travel is not suspended but requires IOC and University President '
-             'approval before booking.'),
+             'Travel to or through these countries, including layovers and connections, requires '
+             'Institutional Oversight Committee (IOC) and University President approval before booking.'),
         ]
         for color, heading, definition in tier_defs:
             self.set_font('Helvetica', 'B', 9)
@@ -1519,11 +1523,11 @@ class TravelAdvisoryPDF(FPDF):
 
         # UT Suspended countries
         for adv in sorted(ut_suspended, key=lambda a: a.country_name):
-            rows.append((adv, 'UT SUSPENDED', self.UT_SUSPENDED_COLOR, 'IOC + President req.'))
+            rows.append((adv, 'UT SUSPENDED', self.UT_SUSPENDED_COLOR, 'IOC + President req. (incl. layovers)'))
 
         # Restricted / elevated approval countries
         for adv in sorted(restricted_special, key=lambda a: a.country_name):
-            rows.append((adv, 'RESTRICTED', self.RESTRICTED_SPECIAL_COLOR, 'IOC + President req.'))
+            rows.append((adv, 'RESTRICTED', self.RESTRICTED_SPECIAL_COLOR, 'IOC + President req. (incl. layovers)'))
 
         # Level 4 countries
         l4 = sorted(
@@ -1658,7 +1662,7 @@ def create_report(
     Args:
         prohibited: List of prohibited country advisories (Texas EO GA-48).
         ut_suspended: List of UT System suspended travel advisories.
-        restricted_special: List of advisories requiring IOC + President approval.
+        restricted_special: List of advisories requiring Institutional Oversight Committee (IOC) + President approval.
         advisories: List of general high-risk advisories to include.
         output_path: Where to save the PDF.
 
