@@ -1521,13 +1521,45 @@ class TravelAdvisoryPDF(FPDF):
         for adv in sorted(prohibited, key=lambda a: a.country_name):
             rows.append((adv, 'PROHIBITED', self.PROHIBITED_COLOR, 'EO GA-48'))
 
-        # UT Suspended countries
-        for adv in sorted(ut_suspended, key=lambda a: a.country_name):
-            rows.append((adv, 'UT SUSPENDED', self.UT_SUSPENDED_COLOR, 'IOC + President req. (incl. layovers)'))
+        # UT Suspended countries — iterate the policy dict so all entries always appear,
+        # regardless of whether the State Dept API returned a matching advisory.
+        # Skip entries already covered by the prohibited bucket (waterfall).
+        for name, info in sorted(UT_SUSPENDED_TRAVEL.items()):
+            if is_prohibited_country(name):
+                continue
+            display_name = name
+            if info.get('includes'):
+                display_name += f" (incl. {', '.join(info['includes'])})"
+            matched = next(
+                (a for a in ut_suspended if name.lower() in a.country_name.lower()), None
+            )
+            stub = TravelAdvisory(
+                country_name=display_name,
+                country_code=info.get('code', matched.country_code if matched else ''),
+                overall_level=matched.overall_level if matched else 0,
+                summary='',
+                last_updated=matched.last_updated if matched else datetime.now(),
+                link=matched.link if matched else '',
+            )
+            rows.append((stub, 'UT SUSPENDED', self.UT_SUSPENDED_COLOR, 'IOC + President req. (incl. layovers)'))
 
-        # Restricted / elevated approval countries
-        for adv in sorted(restricted_special, key=lambda a: a.country_name):
-            rows.append((adv, 'RESTRICTED', self.RESTRICTED_SPECIAL_COLOR, 'IOC + President req. (incl. layovers)'))
+        # Restricted / elevated approval — same pattern as UT Suspended above.
+        for name, info in sorted(RESTRICTED_TRAVEL_REQUIRING_SPECIAL_APPROVAL.items()):
+            display_name = name
+            if info.get('includes'):
+                display_name += f" (incl. {', '.join(info['includes'])})"
+            matched = next(
+                (a for a in restricted_special if name.lower() in a.country_name.lower()), None
+            )
+            stub = TravelAdvisory(
+                country_name=display_name,
+                country_code=info.get('code', matched.country_code if matched else ''),
+                overall_level=matched.overall_level if matched else 0,
+                summary='',
+                last_updated=matched.last_updated if matched else datetime.now(),
+                link=matched.link if matched else '',
+            )
+            rows.append((stub, 'RESTRICTED', self.RESTRICTED_SPECIAL_COLOR, 'IOC + President req. (incl. layovers)'))
 
         # Level 4 countries
         l4 = sorted(
