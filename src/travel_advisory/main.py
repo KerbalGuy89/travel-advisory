@@ -91,6 +91,131 @@ PROHIBITED_COUNTRY_NAMES = {
     "venezuela",
 }
 
+# =============================================================================
+# UT SUSPENDED TRAVEL - UT System Travel Suspension
+# =============================================================================
+# Travel to these countries is suspended by the UT System. Exceptions require
+# approval from both the International Office Coordinator (IOC) and the
+# University President.
+#
+# Note: Iran and Russia also appear in PROHIBITED_COUNTRIES. The filter
+# waterfall places them in the prohibited bucket first; they will never reach
+# the ut_suspended bucket.
+# =============================================================================
+
+UT_SUSPENDED_TRAVEL = {
+    "Lebanon": {
+        "code": "LB",
+        "includes": [],
+        "official_name": "Lebanese Republic",
+    },
+    "Iraq": {
+        "code": "IQ",
+        "includes": [],
+        "official_name": "Republic of Iraq",
+    },
+    "Yemen": {
+        "code": "YE",
+        "includes": [],
+        "official_name": "Republic of Yemen",
+    },
+    "Syria": {
+        "code": "SY",
+        "includes": [],
+        "official_name": "Syrian Arab Republic",
+    },
+    "Iran": {
+        "code": "IR",
+        "includes": [],
+        "official_name": "Islamic Republic of Iran",
+    },
+    "Israel": {
+        "code": "IL",
+        "includes": ["West Bank", "Gaza"],
+        "official_name": "State of Israel",
+    },
+    "Russia": {
+        "code": "RU",
+        "includes": [],
+        "official_name": "Russian Federation",
+    },
+    "Ukraine": {
+        "code": "UA",
+        "includes": [],
+        "official_name": "Ukraine",
+    },
+    "Belarus": {
+        "code": "BY",
+        "includes": [],
+        "official_name": "Republic of Belarus",
+    },
+    "Jordan": {
+        "code": "JO",
+        "includes": [],
+        "official_name": "Hashemite Kingdom of Jordan",
+    },
+    "UAE": {
+        "code": "AE",
+        "includes": [],
+        "official_name": "United Arab Emirates",
+    },
+    "Qatar": {
+        "code": "QA",
+        "includes": [],
+        "official_name": "State of Qatar",
+    },
+    "Oman": {
+        "code": "OM",
+        "includes": [],
+        "official_name": "Sultanate of Oman",
+    },
+    "Bahrain": {
+        "code": "BH",
+        "includes": [],
+        "official_name": "Kingdom of Bahrain",
+    },
+    "Kuwait": {
+        "code": "KW",
+        "includes": [],
+        "official_name": "State of Kuwait",
+    },
+    "Saudi Arabia": {
+        "code": "SA",
+        "includes": [],
+        "official_name": "Kingdom of Saudi Arabia",
+    },
+}
+
+# =============================================================================
+# RESTRICTED TRAVEL REQUIRING SPECIAL APPROVAL - UT System Elevated Approval
+# =============================================================================
+# Travel to these countries is not suspended but requires elevated approval
+# from both the IOC and the University President before booking.
+# =============================================================================
+
+RESTRICTED_TRAVEL_REQUIRING_SPECIAL_APPROVAL = {
+    "Moldova": {
+        "code": "MD",
+        "includes": [],
+        "official_name": "Republic of Moldova",
+    },
+    "Egypt": {
+        "code": "EG",
+        "includes": [],
+        "official_name": "Arab Republic of Egypt",
+    },
+    "Cyprus": {
+        "code": "CY",
+        "includes": [],
+        "official_name": "Republic of Cyprus",
+    },
+    "Turkey": {
+        "code": "TR",
+        "includes": [],
+        "official_name": "Republic of Turkey",
+    },
+}
+
 # Country code to flag emoji mapping (uses regional indicator symbols)
 # This converts 2-letter ISO codes to flag emojis
 def country_code_to_flag(code: str) -> str:
@@ -661,6 +786,32 @@ def is_prohibited_country(country_name: str) -> bool:
     return any(prohibited in name_lower for prohibited in PROHIBITED_COUNTRY_NAMES)
 
 
+def _match_country_dict(country_name: str, country_dict: dict) -> bool:
+    """Check if a country name matches any entry in a country dictionary.
+
+    Matches against canonical key names and all entries in 'includes' lists,
+    using case-insensitive substring matching in both directions.
+    """
+    name_lower = country_name.lower().strip()
+    for key, info in country_dict.items():
+        if key.lower() in name_lower or name_lower in key.lower():
+            return True
+        for alias in info.get("includes", []):
+            if alias.lower() in name_lower or name_lower in alias.lower():
+                return True
+    return False
+
+
+def is_ut_suspended_country(country_name: str) -> bool:
+    """Check if a country is on the UT System suspended travel list."""
+    return _match_country_dict(country_name, UT_SUSPENDED_TRAVEL)
+
+
+def is_restricted_special_country(country_name: str) -> bool:
+    """Check if a country requires IOC + President elevated approval."""
+    return _match_country_dict(country_name, RESTRICTED_TRAVEL_REQUIRING_SPECIAL_APPROVAL)
+
+
 def deduplicate_advisories(
     advisories: list[TravelAdvisory],
 ) -> tuple[list[TravelAdvisory], list[str]]:
@@ -699,30 +850,39 @@ def deduplicate_advisories(
     return list(seen.values()), duplicates
 
 
-def filter_high_risk(advisories: list[TravelAdvisory]) -> tuple[list[TravelAdvisory], list[TravelAdvisory]]:
-    """Filter to only high-risk advisories, separating prohibited countries.
+def filter_high_risk(
+    advisories: list[TravelAdvisory],
+) -> tuple[list[TravelAdvisory], list[TravelAdvisory], list[TravelAdvisory], list[TravelAdvisory]]:
+    """Filter advisories into four priority buckets using a waterfall.
 
-    Includes:
-    - All Level 3 and Level 4 countries
-    - Level 1/2 countries with Level 3/4 regional warnings
-
-    Excludes from high-risk list:
-    - Countries designated as foreign adversaries (Texas EO GA-48)
+    Waterfall priority (first match wins):
+      1. Prohibited       — Texas EO GA-48 foreign adversaries
+      2. UT Suspended     — UT System suspended travel (IOC + President exception required)
+      3. Restricted       — UT System elevated approval required (IOC + President)
+      4. High-risk        — Level 3/4 or Level 1/2 with regional Level 3/4 warnings
 
     Args:
         advisories: List of all parsed advisories.
 
     Returns:
-        Tuple of (prohibited_advisories, high_risk_advisories).
-        Prohibited countries are separated and excluded from high-risk list.
+        Tuple of (prohibited, ut_suspended, restricted_special, high_risk).
     """
     prohibited = []
+    ut_suspended = []
+    restricted_special = []
     high_risk = []
 
     for advisory in advisories:
-        # Check if this is a prohibited country first
         if is_prohibited_country(advisory.country_name):
             prohibited.append(advisory)
+            continue
+
+        if is_ut_suspended_country(advisory.country_name):
+            ut_suspended.append(advisory)
+            continue
+
+        if is_restricted_special_country(advisory.country_name):
+            restricted_special.append(advisory)
             continue
 
         # Include if overall level is 3 or 4
@@ -734,13 +894,12 @@ def filter_high_risk(advisories: list[TravelAdvisory]) -> tuple[list[TravelAdvis
         if advisory.has_regional_elevation and advisory.max_regional_level >= 3:
             high_risk.append(advisory)
 
-    # Sort prohibited alphabetically
     prohibited.sort(key=lambda a: a.country_name)
-
-    # Sort high-risk by overall level (descending), then by max regional level, then by name
+    ut_suspended.sort(key=lambda a: a.country_name)
+    restricted_special.sort(key=lambda a: a.country_name)
     high_risk.sort(key=lambda a: (-a.overall_level, -a.max_regional_level, a.country_name))
 
-    return prohibited, high_risk
+    return prohibited, ut_suspended, restricted_special, high_risk
 
 
 # Canonical risk factor keywords, ordered by severity (most severe first).
@@ -977,11 +1136,13 @@ class TravelAdvisoryPDF(FPDF):
     """Custom PDF class for travel advisory reports."""
 
     # Color scheme
-    PROHIBITED_COLOR = (80, 0, 80)   # Dark purple - prohibited countries
-    LEVEL_4_COLOR = (180, 30, 30)    # Dark red
-    LEVEL_3_COLOR = (200, 120, 0)    # Orange
-    LEVEL_2_COLOR = (180, 150, 0)    # Yellow-orange
-    LEVEL_1_COLOR = (60, 140, 60)    # Green
+    PROHIBITED_COLOR = (80, 0, 80)        # Dark purple - prohibited countries
+    UT_SUSPENDED_COLOR = (180, 60, 0)     # Deep orange - UT suspended travel
+    RESTRICTED_SPECIAL_COLOR = (160, 110, 0)  # Amber - restricted/elevated approval
+    LEVEL_4_COLOR = (180, 30, 30)         # Dark red
+    LEVEL_3_COLOR = (200, 120, 0)         # Orange
+    LEVEL_2_COLOR = (180, 150, 0)         # Yellow-orange
+    LEVEL_1_COLOR = (60, 140, 60)         # Green
 
     NAVY = (30, 60, 100)
     DARK_GRAY = (40, 40, 40)
@@ -1304,12 +1465,15 @@ class TravelAdvisoryPDF(FPDF):
     def add_summary_section(
         self,
         prohibited: list[TravelAdvisory],
+        ut_suspended: list[TravelAdvisory],
+        restricted_special: list[TravelAdvisory],
         advisories: list[TravelAdvisory],
     ):
         """Add a unified quick-reference table of all countries in the report.
 
-        Prohibited countries appear first, followed by Level 4, Level 3, then
-        countries with regional warnings (Level 2/1), each sorted alphabetically.
+        Order: Prohibited → UT Suspended → Restricted/Special Approval →
+        Level 4 → Level 3 → Level 2/1 with regional warnings.
+        Each group is sorted alphabetically within the group.
         """
         self.add_page()
 
@@ -1319,12 +1483,47 @@ class TravelAdvisoryPDF(FPDF):
         self.cell(0, 10, 'Quick Reference - Countries by Risk Level', align='C')
         self.ln(12)
 
+        # Tier definitions printed above the table
+        tier_defs = [
+            (self.PROHIBITED_COLOR,
+             'PROHIBITED (Texas EO GA-48):',
+             'Travel is prohibited for UT employees per Texas Executive Order GA-48 '
+             'designating these countries as foreign adversaries.'),
+            (self.UT_SUSPENDED_COLOR,
+             'UT SUSPENDED:',
+             'UT System travel is suspended; exceptions require approval from both '
+             'the International Office Coordinator (IOC) and the University President.'),
+            (self.RESTRICTED_SPECIAL_COLOR,
+             'RESTRICTED - ELEVATED APPROVAL:',
+             'Travel is not suspended but requires IOC and University President '
+             'approval before booking.'),
+        ]
+        for color, heading, definition in tier_defs:
+            self.set_font('Helvetica', 'B', 9)
+            self.set_text_color(*color)
+            self.cell(0, 5, heading)
+            self.ln(5)
+            self.set_font('Helvetica', 'I', 8)
+            self.set_text_color(*self.DARK_GRAY)
+            self.multi_cell(0, 4, self._clean_text(definition),
+                            new_x='LMARGIN', new_y='NEXT')
+            self.ln(2)
+        self.ln(3)
+
         # Build sorted row list: (advisory, label, color, notes)
         rows: list[tuple[TravelAdvisory, str, tuple, str]] = []
 
         # Prohibited countries first (alphabetical)
         for adv in sorted(prohibited, key=lambda a: a.country_name):
             rows.append((adv, 'PROHIBITED', self.PROHIBITED_COLOR, 'EO GA-48'))
+
+        # UT Suspended countries
+        for adv in sorted(ut_suspended, key=lambda a: a.country_name):
+            rows.append((adv, 'UT SUSPENDED', self.UT_SUSPENDED_COLOR, 'IOC + President req.'))
+
+        # Restricted / elevated approval countries
+        for adv in sorted(restricted_special, key=lambda a: a.country_name):
+            rows.append((adv, 'RESTRICTED', self.RESTRICTED_SPECIAL_COLOR, 'IOC + President req.'))
 
         # Level 4 countries
         l4 = sorted(
@@ -1429,7 +1628,9 @@ class TravelAdvisoryPDF(FPDF):
         self.multi_cell(0, 4, self._clean_text(
             'EO GA-48: Texas Executive Order GA-48 (Nov 2024) prohibits state employee '
             'work-related travel to countries designated as foreign adversaries per 15 CFR 791.4.\n'
-            'DNT = Do Not Travel (Level 4 regions)  |  RT = Reconsider Travel (Level 3 regions)'
+            'DNT = Do Not Travel (Level 4 regions)  |  RT = Reconsider Travel (Level 3 regions)\n'
+            'Note: Prohibited, UT Suspended, and Restricted designations apply to travel '
+            'through these countries as a layover or connection point, regardless of ultimate destination.'
         ), align='L')
 
     @staticmethod
@@ -1447,14 +1648,18 @@ class TravelAdvisoryPDF(FPDF):
 
 def create_report(
     prohibited: list[TravelAdvisory],
+    ut_suspended: list[TravelAdvisory],
+    restricted_special: list[TravelAdvisory],
     advisories: list[TravelAdvisory],
-    output_path: Path
+    output_path: Path,
 ) -> Path:
     """Generate the PDF report.
 
     Args:
         prohibited: List of prohibited country advisories (Texas EO GA-48).
-        advisories: List of high-risk advisories to include.
+        ut_suspended: List of UT System suspended travel advisories.
+        restricted_special: List of advisories requiring IOC + President approval.
+        advisories: List of general high-risk advisories to include.
         output_path: Where to save the PDF.
 
     Returns:
@@ -1465,7 +1670,9 @@ def create_report(
     # Calculate statistics
     stats = {
         'prohibited': len(prohibited),
-        'total': len(prohibited) + len(advisories),
+        'ut_suspended': len(ut_suspended),
+        'restricted_special': len(restricted_special),
+        'total': len(prohibited) + len(ut_suspended) + len(restricted_special) + len(advisories),
         'level_4': sum(1 for a in advisories if a.overall_level == 4),
         'level_3': sum(1 for a in advisories if a.overall_level == 3),
         'regional': sum(1 for a in advisories if a.overall_level < 3 and a.has_regional_elevation),
@@ -1474,8 +1681,8 @@ def create_report(
     # Title page with statistics
     pdf.add_title_page(stats)
 
-    # Unified quick-reference table (prohibited + high-risk)
-    pdf.add_summary_section(prohibited, advisories)
+    # Unified quick-reference table (prohibited + ut_suspended + restricted + high-risk)
+    pdf.add_summary_section(prohibited, ut_suspended, restricted_special, advisories)
 
     # Detailed entries - Level 4 first
     pdf.add_page()
@@ -1509,6 +1716,10 @@ class VerificationReport:
         self.after_dedup_count: int = 0
         self.prohibited_matched: dict[str, str] = {}   # name -> matched API entry
         self.prohibited_unmatched: list[str] = []
+        self.ut_suspended_matched: dict[str, str] = {}
+        self.ut_suspended_unmatched: list[str] = []
+        self.restricted_special_matched: dict[str, str] = {}
+        self.restricted_special_unmatched: list[str] = []
         self.level_4_countries: list[str] = []
         self.level_3_countries: list[str] = []
         self.regional_countries: list[str] = []
@@ -1528,7 +1739,7 @@ class VerificationReport:
         return self.data_hash
 
     def populate_prohibited_audit(self, prohibited_advisories: list[TravelAdvisory]):
-        """Check which of the 6 expected prohibited countries were matched in API data."""
+        """Check which expected prohibited countries were matched in API data."""
         for name in PROHIBITED_COUNTRIES:
             match = next(
                 (a for a in prohibited_advisories if name.lower() in a.country_name.lower()),
@@ -1538,6 +1749,30 @@ class VerificationReport:
                 self.prohibited_matched[name] = match.country_name
             else:
                 self.prohibited_unmatched.append(name)
+
+    def populate_ut_suspended_audit(self, ut_suspended_advisories: list[TravelAdvisory]):
+        """Check which expected UT suspended countries were matched in API data."""
+        for name in UT_SUSPENDED_TRAVEL:
+            match = next(
+                (a for a in ut_suspended_advisories if name.lower() in a.country_name.lower()),
+                None
+            )
+            if match:
+                self.ut_suspended_matched[name] = match.country_name
+            else:
+                self.ut_suspended_unmatched.append(name)
+
+    def populate_restricted_special_audit(self, restricted_advisories: list[TravelAdvisory]):
+        """Check which expected restricted/special-approval countries were matched in API data."""
+        for name in RESTRICTED_TRAVEL_REQUIRING_SPECIAL_APPROVAL:
+            match = next(
+                (a for a in restricted_advisories if name.lower() in a.country_name.lower()),
+                None
+            )
+            if match:
+                self.restricted_special_matched[name] = match.country_name
+            else:
+                self.restricted_special_unmatched.append(name)
 
     def populate_high_risk_breakdown(self, high_risk: list[TravelAdvisory]):
         """Record the high-risk breakdown by level."""
@@ -1553,20 +1788,36 @@ class VerificationReport:
     def run_assertions(
         self,
         prohibited: list[TravelAdvisory],
+        ut_suspended: list[TravelAdvisory],
+        restricted_special: list[TravelAdvisory],
         high_risk: list[TravelAdvisory],
         all_advisories: list[TravelAdvisory] | None = None,
     ) -> bool:
         """Run verification assertions. Returns True if all pass."""
         self.assertion_errors = []
 
-        # 1. No prohibited country leaked into high-risk list
-        for adv in high_risk:
+        # 1. No prohibited country leaked into any lower-priority bucket
+        for adv in ut_suspended + restricted_special + high_risk:
             if is_prohibited_country(adv.country_name):
                 self.assertion_errors.append(
-                    f"LEAK: Prohibited country '{adv.country_name}' found in high-risk list"
+                    f"LEAK: Prohibited country '{adv.country_name}' found outside prohibited bucket"
                 )
 
-        # 2. Parse failure rate < 5%
+        # 2. No UT suspended country leaked into restricted or high-risk
+        for adv in restricted_special + high_risk:
+            if is_ut_suspended_country(adv.country_name):
+                self.assertion_errors.append(
+                    f"LEAK: UT suspended country '{adv.country_name}' found outside ut_suspended bucket"
+                )
+
+        # 3. No restricted country leaked into high-risk
+        for adv in high_risk:
+            if is_restricted_special_country(adv.country_name):
+                self.assertion_errors.append(
+                    f"LEAK: Restricted country '{adv.country_name}' found in high-risk list"
+                )
+
+        # 4. Parse failure rate < 5%
         if self.raw_count > 0:
             failure_rate = self.parse_failures / self.raw_count
             if failure_rate >= 0.05:
@@ -1575,12 +1826,16 @@ class VerificationReport:
                     f"({failure_rate:.1%}) exceeds 5% threshold"
                 )
 
-        # 3. At least 1 high-risk country found (sanity check)
+        # 5. At least 1 high-risk country found (sanity check)
         if len(high_risk) == 0:
             self.assertion_errors.append("SANITY: Zero high-risk countries found")
 
-        # 4. No duplicate country codes remain after dedup
-        codes = [a.country_code for a in (list(prohibited) + list(high_risk)) if a.country_code]
+        # 6. No duplicate country codes remain after dedup
+        codes = [
+            a.country_code
+            for a in list(prohibited) + list(ut_suspended) + list(restricted_special) + list(high_risk)
+            if a.country_code
+        ]
         seen_codes: set[str] = set()
         for code in codes:
             if code in seen_codes:
@@ -1637,6 +1892,30 @@ class VerificationReport:
             for name in self.prohibited_unmatched:
                 lines.append(f"  [MISS] {name} — no API entry found")
 
+        # UT Suspended audit
+        lines.append("")
+        lines.append("--- UT SUSPENDED TRAVEL AUDIT ---")
+        lines.append(f"Expected: {len(UT_SUSPENDED_TRAVEL)} countries")
+        lines.append(f"Matched:  {len(self.ut_suspended_matched)}")
+        for name, api_entry in self.ut_suspended_matched.items():
+            lines.append(f"  [OK]   {name} -> '{api_entry}'")
+        if self.ut_suspended_unmatched:
+            lines.append(f"Unmatched: {len(self.ut_suspended_unmatched)}")
+            for name in self.ut_suspended_unmatched:
+                lines.append(f"  [MISS] {name} — no API entry found (may be prohibited-only)")
+
+        # Restricted special approval audit
+        lines.append("")
+        lines.append("--- RESTRICTED / ELEVATED APPROVAL AUDIT ---")
+        lines.append(f"Expected: {len(RESTRICTED_TRAVEL_REQUIRING_SPECIAL_APPROVAL)} countries")
+        lines.append(f"Matched:  {len(self.restricted_special_matched)}")
+        for name, api_entry in self.restricted_special_matched.items():
+            lines.append(f"  [OK]   {name} -> '{api_entry}'")
+        if self.restricted_special_unmatched:
+            lines.append(f"Unmatched: {len(self.restricted_special_unmatched)}")
+            for name in self.restricted_special_unmatched:
+                lines.append(f"  [MISS] {name} — no API entry found")
+
         # High-risk breakdown
         lines.append("")
         lines.append("--- HIGH-RISK BREAKDOWN ---")
@@ -1680,7 +1959,9 @@ class VerificationReport:
                 lines.append(f"  [FAIL] {err}")
         else:
             lines.append("ALL PASSED")
-            lines.append("  [OK] No prohibited countries leaked into high-risk list")
+            lines.append("  [OK] No prohibited countries leaked into lower-priority buckets")
+            lines.append("  [OK] No UT suspended countries leaked into restricted or high-risk")
+            lines.append("  [OK] No restricted countries leaked into high-risk list")
             lines.append(f"  [OK] Parse failure rate within threshold ({self.parse_failures}/{self.raw_count})")
             lines.append(f"  [OK] High-risk countries found ({len(self.high_risk_names)})")
             lines.append("  [OK] No duplicate country codes after dedup")
@@ -1749,16 +2030,26 @@ def main():
     if dup_descriptions:
         print(f"Removed {len(dup_descriptions)} duplicate(s).")
 
-    # Filter to high-risk only, separating prohibited countries
-    prohibited, high_risk = filter_high_risk(advisories)
+    # Filter into four priority buckets
+    prohibited, ut_suspended, restricted_special, high_risk = filter_high_risk(advisories)
 
     # Populate verification details
     verification.populate_prohibited_audit(prohibited)
+    verification.populate_ut_suspended_audit(ut_suspended)
+    verification.populate_restricted_special_audit(restricted_special)
     verification.populate_high_risk_breakdown(high_risk)
-    verification.compute_data_hash(prohibited + high_risk)
+    verification.compute_data_hash(prohibited + ut_suspended + restricted_special + high_risk)
 
     print(f"\nProhibited countries (Texas EO GA-48): {len(prohibited)}")
     for adv in prohibited:
+        print(f"  - {adv.country_name}")
+
+    print(f"\nUT System suspended travel: {len(ut_suspended)}")
+    for adv in ut_suspended:
+        print(f"  - {adv.country_name}")
+
+    print(f"\nRestricted / elevated approval required: {len(restricted_special)}")
+    for adv in restricted_special:
         print(f"  - {adv.country_name}")
 
     print(f"\nFound {len(high_risk)} additional high-risk destinations:")
@@ -1771,7 +2062,9 @@ def main():
     print(f"  - Level 1/2 with regional warnings: {len(regional)}")
 
     # Run verification assertions
-    assertions_passed = verification.run_assertions(prohibited, high_risk, all_advisories=advisories)
+    assertions_passed = verification.run_assertions(
+        prohibited, ut_suspended, restricted_special, high_risk, all_advisories=advisories
+    )
 
     if args.list_only:
         print("\n" + "=" * 60)
@@ -1780,6 +2073,20 @@ def main():
         for name, info in PROHIBITED_COUNTRIES.items():
             includes = f" (incl. {', '.join(info['includes'])})" if info['includes'] else ""
             print(f"[PROHIBITED] {name}{includes}")
+
+        print("\n" + "=" * 60)
+        print("UT SUSPENDED TRAVEL")
+        print("=" * 60)
+        for name, info in UT_SUSPENDED_TRAVEL.items():
+            includes = f" (incl. {', '.join(info['includes'])})" if info['includes'] else ""
+            print(f"[UT SUSPENDED] {name}{includes}")
+
+        print("\n" + "=" * 60)
+        print("RESTRICTED / ELEVATED APPROVAL REQUIRED")
+        print("=" * 60)
+        for name, info in RESTRICTED_TRAVEL_REQUIRING_SPECIAL_APPROVAL.items():
+            includes = f" (incl. {', '.join(info['includes'])})" if info['includes'] else ""
+            print(f"[RESTRICTED] {name}{includes}")
 
         print("\n" + "=" * 60)
         print("HIGH-RISK COUNTRIES")
@@ -1811,7 +2118,7 @@ def main():
 
     # Generate PDF
     print(f"\nGenerating PDF report...")
-    create_report(prohibited, high_risk, output_path)
+    create_report(prohibited, ut_suspended, restricted_special, high_risk, output_path)
 
     # Write verification log alongside PDF
     verification.write(verification_path)
