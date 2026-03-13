@@ -1148,10 +1148,10 @@ def generate_country_summary(advisory: TravelAdvisory) -> str:
 class TravelAdvisoryPDF(FPDF):
     """Custom PDF class for travel advisory reports."""
 
-    # Color scheme
+    # Color scheme — brand palette
     PROHIBITED_COLOR = (80, 0, 80)        # Dark purple - prohibited countries
-    UT_SUSPENDED_COLOR = (180, 60, 0)     # Deep orange - UT suspended travel
-    RESTRICTED_SPECIAL_COLOR = (160, 110, 0)  # Amber - restricted/elevated approval
+    UT_SUSPENDED_COLOR = (242, 101, 49)   # #F26531 Orange - UT suspended travel
+    RESTRICTED_SPECIAL_COLOR = (99, 100, 102)  # #636466 Gray - restricted/elevated approval
     LEVEL_4_COLOR = (180, 30, 30)         # Dark red
     LEVEL_3_COLOR = (200, 120, 0)         # Orange
     LEVEL_2_COLOR = (180, 150, 0)         # Yellow-orange
@@ -1447,7 +1447,7 @@ class TravelAdvisoryPDF(FPDF):
         # Link to full advisory
         if advisory.link:
             self.set_font('Helvetica', 'I', 10)
-            self.set_text_color(0, 80, 180)
+            self.set_text_color(0, 76, 151)  # #004c97 Deep Blue
             self.set_x(10)
             self.multi_cell(0, 5, f'Full Advisory: {advisory.link}', align='L',
                             new_x='LMARGIN', new_y='NEXT')
