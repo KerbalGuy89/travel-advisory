@@ -1194,7 +1194,7 @@ class TravelAdvisoryPDF(FPDF):
         if self.page_no() > 1:
             self.set_font('Helvetica', 'B', 10)
             self.set_text_color(*self.MEDIUM_GRAY)
-            self.cell(0, 8, 'US State Department Travel Advisories - High Risk Report', align='C')
+            self.cell(0, 8, self._clean_text('Travel Advisory Report \u2014 High Risk Destinations & Compliance Guidelines'), align='C')
             self.ln(8)
 
     def footer(self):
@@ -1238,43 +1238,58 @@ class TravelAdvisoryPDF(FPDF):
         self.cell(box_width, 10, 'Summary', fill=True, align='C')
         self.ln(12)
 
-        # Stats
-        self.set_font('Helvetica', '', 11)
-        self.set_text_color(*self.DARK_GRAY)
+        # Stats bulleted list
+        EO_URL = (
+            'https://gov.texas.gov/uploads/files/press/EO-GA-48_Hardening'
+            '_State_Government_FINAL_11-19-2024.pdf'
+        )
+        bullet_x = 15
+        text_x = 22
+        text_w = self.epw - (text_x - 10)
+        line_h = 7
 
-        stat_items = [
-            (f"PROHIBITED (Texas EO GA-48): {stats.get('prohibited', 0)} countries", self.PROHIBITED_COLOR),
-            (f"UT Suspended: {stats.get('ut_suspended', 0)} countries", self.LEVEL_4_COLOR),
-            (f"Restricted — Elevated Approval: {stats.get('restricted', 0)} countries", self.LEVEL_3_COLOR),
-            (f"Level 4 (Do Not Travel): {stats.get('level_4', 0)} countries", self.LEVEL_4_COLOR),
-            (f"Level 3 (Reconsider Travel): {stats.get('level_3', 0)} countries", self.LEVEL_3_COLOR),
-            (f"Countries with Regional Warnings: {stats.get('regional', 0)}", self.LEVEL_2_COLOR),
-            (f"Total Unique Entries: {stats.get('total', 0)}", self.NAVY),
+        # Each entry: (text_before_link, link_label_or_None, link_url_or_None)
+        bullets = [
+            (f"PROHIBITED (EO GA-48) ({stats.get('prohibited', 0)}): "
+             f"Designated foreign adversaries; travel subject to ",
+             'EO GA-48', EO_URL),
+            (f"UT Suspended ({stats.get('ut_suspended', 0)}): "
+             f"Active suspension incl. layovers; ITOC + President approval required",
+             None, None),
+            (f"Restricted - Elevated Approval ({stats.get('restricted', 0)}): "
+             f"ITOC + President approval required prior to booking, incl. layovers",
+             None, None),
+            (f"Level 4 - Do Not Travel ({stats.get('level_4', 0)}): "
+             f"Designated Area of High Risk; State Dept advises against all travel; ITOC review approval required",
+             None, None),
+            (f"Level 3 - Reconsider Travel ({stats.get('level_3', 0)}): "
+             f"Designated Area of High Risk; State Dept advises reconsidering travel due to serious risks; ITOC review approval required",
+             None, None),
+            (f"Regional Warnings ({stats.get('regional', 0)}): "
+             f"Contains Level 3/4 regions despite lower overall country rating",
+             None, None),
+            (f"Total Unique Entries ({stats.get('total', 0)})",
+             None, None),
         ]
 
-        for text, color in stat_items:
-            self.set_x(50)
-            self.set_fill_color(*color)
-            self.cell(5, 6, '', fill=True)
-            self.set_x(58)
-            self.set_text_color(*self.DARK_GRAY)
-            self.multi_cell(0, 6, text,
-                            new_x='LMARGIN', new_y='NEXT')
-            self.ln(2)
+        self.set_font('Helvetica', '', 10)
+        self.set_text_color(*self.DARK_GRAY)
 
-        # Legend
-        self.ln(15)
-        self.set_font('Helvetica', 'B', 12)
-        self.set_text_color(*self.NAVY)
-        self.cell(0, 6, 'Advisory Level Definitions:', align='C')
-        self.ln(8)
-
-        self.set_font('Helvetica', 'B', 11)
-        for level, name in LEVEL_NAMES.items():
-            self.set_x(50)
-            self.set_text_color(*self.get_level_color(level))
-            self.cell(0, 6, f'Level {level}: {name}')
-            self.ln(6)
+        for text, link_label, link_url in bullets:
+            self.set_x(bullet_x)
+            self.cell(text_x - bullet_x, line_h, '-')
+            if link_label:
+                self.set_x(text_x)
+                self.write(line_h, self._clean_text(text))
+                self.set_text_color(0, 76, 151)
+                self.write(line_h, link_label, link=link_url)
+                self.set_text_color(*self.DARK_GRAY)
+                self.ln(line_h)
+            else:
+                self.set_x(text_x)
+                self.multi_cell(text_w, line_h, self._clean_text(text),
+                                new_x='LMARGIN', new_y='NEXT')
+            self.ln(4)
 
     def add_prohibited_section(self, prohibited_advisories: list[TravelAdvisory]):
         """Add the prohibited countries section (Texas EO GA-48)."""
