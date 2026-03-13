@@ -1217,12 +1217,9 @@ class TravelAdvisoryPDF(FPDF):
         # Subtitle
         self.set_font('Helvetica', '', 14)
         self.set_text_color(*self.MEDIUM_GRAY)
-        self.cell(0, 8, 'Areas of High Risk', align='C')
+        self.cell(0, 8, 'High-Risk Destinations Subject to ITOC Review', align='C')
         self.ln(8)
 
-        # Source
-        self.set_font('Helvetica', 'I', 10)
-        self.cell(0, 6, 'US Department of State', align='C')
         self.ln(20)
 
         # Generation date
@@ -1247,10 +1244,12 @@ class TravelAdvisoryPDF(FPDF):
 
         stat_items = [
             (f"PROHIBITED (Texas EO GA-48): {stats.get('prohibited', 0)} countries", self.PROHIBITED_COLOR),
+            (f"UT Suspended: {stats.get('ut_suspended', 0)} countries", self.LEVEL_4_COLOR),
+            (f"Restricted — Elevated Approval: {stats.get('restricted', 0)} countries", self.LEVEL_3_COLOR),
             (f"Level 4 (Do Not Travel): {stats.get('level_4', 0)} countries", self.LEVEL_4_COLOR),
             (f"Level 3 (Reconsider Travel): {stats.get('level_3', 0)} countries", self.LEVEL_3_COLOR),
             (f"Countries with Regional Warnings: {stats.get('regional', 0)}", self.LEVEL_2_COLOR),
-            (f"Total Entries: {stats.get('total', 0)}", self.NAVY),
+            (f"Total Unique Entries: {stats.get('total', 0)}", self.NAVY),
         ]
 
         for text, color in stat_items:
@@ -1717,6 +1716,7 @@ def create_report(
     stats = {
         'prohibited': len(prohibited),
         'ut_suspended': len(ut_suspended),
+        'restricted': len(restricted_special),
         'restricted_special': len(restricted_special),
         'total': len(prohibited) + len(ut_suspended) + len(restricted_special) + len(advisories),
         'level_4': sum(1 for a in advisories if a.overall_level == 4),
