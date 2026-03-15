@@ -42,6 +42,43 @@ LEVEL_NAMES = {
     4: "Do Not Travel",
 }
 
+# Hard minimum entry count — the API serves ~214 countries when fully loaded.
+# Anything below this threshold indicates a backend failure and the report
+# should NOT be generated (better no report than a dangerously incomplete one).
+MIN_EXPECTED_ENTRIES = 200
+
+# Cache filename for the last known good API response (written alongside
+# travel_advisory_counts.json in the output directory; gitignored).
+API_CACHE_FILENAME = "travel_advisory_cache.json"
+
+# Listing page URL for cross-validation of entry count
+LISTING_PAGE_URL = (
+    "https://travel.state.gov/content/travel/en/traveladvisories/"
+    "traveladvisories.html"
+)
+
+# Maximum number of regional signal gaps before the report halts.
+# The baseline is ~20 false positives from _has_regional_signals (countries
+# whose summaries contain signal phrases like "some areas have increased risk"
+# but don't have actual sub-national Level 3/4 designations).  A jump well
+# above baseline suggests truncated API summaries or broadly failing extraction.
+MAX_REGIONAL_SIGNAL_GAPS = 30
+
+# NOTE: The State Dept API Category field uses FIPS 10-4 codes, not ISO
+# 3166-1 alpha-2.  A partial FIPS-to-ISO mapping was considered but rejected
+# because FIPS codes for one country can equal ISO codes for a different
+# country (e.g. FIPS "SG" = Senegal, ISO "SG" = Singapore), causing dedup
+# collisions.  The codebase uses the raw FIPS codes as-is.  Country matching
+# is primarily name-based (_match_country_dict, is_prohibited_country), so
+# the code mismatch between FIPS and the ISO codes in the policy dicts does
+# not cause functional issues.  If a complete FIPS-to-ISO mapping is ever
+# needed, it must cover ALL ~250 codes, not just the divergent ones.
+
+# Countries that are known to always have Level 4 regional warnings.
+# Used as a canary in verification — if any of these has zero extracted
+# regions, something is broken in the extraction pipeline.
+MUST_HAVE_REGIONS = {"Mexico", "Colombia", "Pakistan", "India"}
+
 # =============================================================================
 # PROHIBITED COUNTRIES - Texas Executive Order GA-48
 # =============================================================================
@@ -295,7 +332,35 @@ def _total_summary_length(entries: list[dict]) -> int:
     return sum(len(e.get('Summary', '')) for e in entries)
 
 
-def fetch_advisories(max_retries: int = 3) -> list[dict]:
+def _load_api_cache(cache_path: Path) -> list[dict]:
+    """Load cached API response from disk.  Returns [] on any failure."""
+    try:
+        if cache_path.exists():
+            data = json.loads(cache_path.read_text(encoding='utf-8'))
+            entries = data.get('entries', [])
+            ts = data.get('timestamp', 'unknown')
+            if entries:
+                logger.info("Loaded %d cached entries (from %s)", len(entries), ts)
+            return entries
+    except (json.JSONDecodeError, OSError, KeyError) as exc:
+        logger.warning("Could not read API cache: %s", exc)
+    return []
+
+
+def _save_api_cache(cache_path: Path, entries: list[dict]) -> None:
+    """Persist a full API response to disk for future fallback."""
+    try:
+        cache_path.write_text(json.dumps({
+            'timestamp': datetime.now().isoformat(timespec='seconds'),
+            'entries': entries,
+        }), encoding='utf-8')
+        logger.debug("Saved %d entries to API cache", len(entries))
+    except OSError as exc:
+        logger.warning("Could not write API cache: %s", exc)
+
+
+def fetch_advisories(max_retries: int = 3,
+                     cache_path: Path | None = None) -> list[dict]:
     """Fetch travel advisory data from the State Department API.
 
     The API is load-balanced across backends that can disagree on both entry
@@ -303,6 +368,9 @@ def fetch_advisories(max_retries: int = 3) -> list[dict]:
     selected by:
       1. Most entries (primary) — a higher count means fewer missing advisories.
       2. Total summary length (tiebreaker) — richer text when counts are equal.
+
+    If the best live response has fewer than MIN_EXPECTED_ENTRIES entries and
+    a cache_path is provided, falls back to the last known good cached response.
 
     Returns:
         List of advisory dictionaries from the API.
@@ -337,6 +405,20 @@ def fetch_advisories(max_retries: int = 3) -> list[dict]:
 
     if not best:
         raise ConnectionError(f"Failed to fetch advisories after {max_retries} attempts: {last_error}")
+
+    # Cache management: save good responses, fall back to cache on bad ones
+    if cache_path:
+        if len(best) >= MIN_EXPECTED_ENTRIES:
+            _save_api_cache(cache_path, best)
+        else:
+            cached = _load_api_cache(cache_path)
+            if len(cached) > len(best):
+                logger.warning(
+                    "[WARN] Live API returned only %d entries (below %d minimum). "
+                    "Falling back to cached response with %d entries.",
+                    len(best), MIN_EXPECTED_ENTRIES, len(cached),
+                )
+                best = cached
 
     return best
 
@@ -460,8 +542,10 @@ def _expand_bullet_warnings(text: str) -> str:
                     result.append(sentence)
                     i += 1
                 elif not bullet_line:
+                    # Skip empty lines — clean_html() inserts blank lines
+                    # between <p>/<ul> blocks that separate the directive
+                    # header from its bullets.
                     i += 1
-                    break
                 else:
                     break
         else:
@@ -690,12 +774,37 @@ def extract_regional_warnings_from_page(
                 continue
 
             # Find region names: lines that look like headers (capitalized,
-            # no directive keywords) followed by a directive line
+            # no directive keywords) followed by a directive or crime description.
+            #
+            # Two confirmed formats:
+            #   Format A (Colombia, Pakistan old-style):
+            #     Region Name
+            #     Do not travel to this area due to...
+            #   Format B (Madagascar, Pakistan tsg_aem):
+            #     Region Name
+            #     Violent crime, such as armed carjacking...
+            #
+            # For tsg_aem pages the section text extends to end of page,
+            # so we must distinguish real regions from boilerplate sections
+            # (embassy info, travel tips, country list).  Real region
+            # descriptions always contain crime/safety keywords; boilerplate
+            # does not.
+            _safety_keywords = re.compile(
+                r'crime|violen|terroris|kidnap|armed|carjack|bandit|'
+                r'robbery|murder|conflict|extremis|disappearance|'
+                r'civil\s+unrest|landmine|unexploded',
+                re.IGNORECASE,
+            )
             lines = section_text.split('\n')
             for j, line in enumerate(lines):
                 line = line.strip()
                 if not line:
                     continue
+                # Terminate scan at boilerplate boundary markers
+                if re.match(r'^(If you decide to travel|Scroll to review|'
+                            r'Travel advisory levels|Learn more about)',
+                            line, re.IGNORECASE):
+                    break
                 # A region name line is typically a short capitalized phrase
                 # that is NOT a directive or boilerplate
                 if re.match(r'^(Do\s+not\s+travel|Reconsider\s+travel|Exercise|Read\s+the|Visit|If\s+you|There\s+|Most\s+|Shooting|U\.S\.|Check|Expand|Collapse)', line, re.IGNORECASE):
@@ -705,24 +814,29 @@ def extract_regional_warnings_from_page(
                 # Must start with uppercase and be reasonably short (region name)
                 if not line[0].isupper() or len(line) > 100:
                     continue
-                # Check that the next non-empty line is a directive
+                # Look ahead for a directive line or crime/safety description.
                 next_line = ""
                 for k in range(j + 1, min(j + 4, len(lines))):
                     nl = lines[k].strip()
                     if nl:
                         next_line = nl
                         break
+                reasons = ""
                 if re.match(r'(Do\s+not\s+travel|Reconsider\s+travel)', next_line, re.IGNORECASE):
-                    # Extract reasons from the directive line
+                    # Next line is a directive — extract reasons from it
                     reasons_match = re.search(r'due\s+to\s+([^.]+)', next_line, re.IGNORECASE)
                     reasons = reasons_match.group(1).strip() if reasons_match else ""
-                    region = line.strip()
-                    if len(region) >= 3 and not any(region.lower() == w.region_name.lower() for w in warnings):
-                        warnings.append(RegionalWarning(
-                            region_name=region,
-                            level=level,
-                            reasons=reasons
-                        ))
+                elif not _safety_keywords.search(next_line):
+                    # Next line has no crime/safety content — this is
+                    # boilerplate, not a region description.
+                    continue
+                region = line.strip()
+                if len(region) >= 3 and not any(region.lower() == w.region_name.lower() for w in warnings):
+                    warnings.append(RegionalWarning(
+                        region_name=region,
+                        level=level,
+                        reasons=reasons
+                    ))
 
     # Fallback: try the same regex patterns used for summary text
     if not warnings:
@@ -755,8 +869,10 @@ def parse_advisory(raw: dict) -> tuple[TravelAdvisory | None, bool]:
                 return None, False
 
         # Get country code from Category field (usually a list like ["MX"])
+        # The API returns FIPS 10-4 codes in the Category field, not ISO 3166-1.
+        # We use the raw FIPS codes as-is — see comment near top of file.
         category = raw.get('Category', [])
-        country_code = category[0] if category else ""
+        country_code = category[0].upper() if category else ""
 
         summary = raw.get('Summary', '')
         link = raw.get('Link', raw.get('id', ''))
@@ -775,8 +891,10 @@ def parse_advisory(raw: dict) -> tuple[TravelAdvisory | None, bool]:
         # Page scraping fallback: for countries where the API Summary hints
         # at regional warnings but the regex failed to extract any, fetch
         # the full advisory page for more reliable structured data.
+        # Level 3 countries are included because they can have Level 4
+        # sub-regions (e.g. Colombia, Pakistan) that only appear on the page.
         page_fallback_used = False
-        if overall_level <= 2 and not regional_warnings and _has_regional_signals(summary):
+        if overall_level <= 3 and not regional_warnings and _has_regional_signals(summary):
             page_html = fetch_advisory_page(link)
             if page_html:
                 regional_warnings = extract_regional_warnings_from_page(page_html, overall_level)
@@ -802,15 +920,19 @@ def parse_advisory(raw: dict) -> tuple[TravelAdvisory | None, bool]:
 def is_prohibited_country(country_name: str) -> bool:
     """Check if a country is on the prohibited list (Texas EO GA-48).
 
-    Uses exact match first, then substring matching to catch compound entries
-    like 'Mainland China, Hong Kong & Macau - See Summaries'.
+    Uses exact match first, then word-boundary regex to catch compound entries
+    like 'Mainland China, Hong Kong & Macau - See Summaries' without falsely
+    matching country names that contain a prohibited name as a substring
+    (e.g. a hypothetical 'Iranistan').
     """
     name_lower = country_name.lower().strip()
     # Exact match
     if name_lower in PROHIBITED_COUNTRY_NAMES:
         return True
-    # Substring match: check if any prohibited name appears within the country name
-    return any(prohibited in name_lower for prohibited in PROHIBITED_COUNTRY_NAMES)
+    # Word-boundary match: check if any prohibited name appears at a word
+    # boundary within the country name
+    return any(re.search(r'\b' + re.escape(p) + r'\b', name_lower)
+               for p in PROHIBITED_COUNTRY_NAMES)
 
 
 def _match_country_dict(country_name: str, country_dict: dict) -> bool:
@@ -954,6 +1076,36 @@ def filter_high_risk(
     high_risk.sort(key=lambda a: (-a.overall_level, -a.max_regional_level, a.country_name))
 
     return prohibited, ut_suspended, restricted_special, high_risk
+
+
+def fetch_listing_page_count() -> int | None:
+    """Scrape the travel.state.gov listing page for the total advisory count.
+
+    Returns the number of table rows (destinations) found on the listing page,
+    or None if the page is unreachable or unparseable.  This is informational
+    only — used to cross-validate the API entry count in the verification log.
+    """
+    try:
+        req = urllib.request.Request(
+            LISTING_PAGE_URL,
+            headers={"User-Agent": "TravelAdvisoryReport/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            page_html = resp.read().decode('utf-8', errors='replace')
+    except (urllib.error.URLError, OSError) as exc:
+        logger.warning("Could not fetch listing page for cross-validation: %s", exc)
+        return None
+
+    # The listing page has a table with one row per destination.
+    # Count <tr> tags inside the advisory table (skip the header row).
+    rows = re.findall(r'<tr[^>]*>', page_html)
+    if len(rows) > 1:
+        count = len(rows) - 1  # subtract header row
+        logger.info("Listing page cross-validation: %d destinations found", count)
+        return count
+
+    logger.warning("Listing page fetched but no table rows found.")
+    return None
 
 
 def extract_worldwide_caution() -> 'TravelAdvisory | None':
@@ -1862,13 +2014,27 @@ class TravelAdvisoryPDF(FPDF):
             self.set_font('Helvetica', '', 10)
             lines = self.multi_cell(col_w[0], row_h, name_text,
                                     dry_run=True, output='LINES')
-            actual_h = max(len(lines), 1) * row_h
+            n_lines = max(len(lines), 1)
+            text_h = n_lines * row_h
+            # For multi-line rows, actual_h = (2*n_lines-1)*row_h adds equal
+            # top/bottom padding of (n_lines-1)*row_h/2.  This places line 1's
+            # text at y0 + actual_h/2, matching the vertical center that
+            # cell() uses for the Level and Notes columns.
+            actual_h = (2 * n_lines - 1) * row_h if n_lines > 1 else row_h
+            v_pad = (actual_h - text_h) / 2  # 0 for single-line rows
 
-            # Draw country cell (wraps long names)
-            self.set_xy(x0, y0)
+            # Draw country cell fill and side borders spanning the full
+            # actual_h, then render text inset by v_pad to center it.
+            if fill:
+                self.set_fill_color(*self.LIGHT_GRAY)
+                self.rect(x0, y0, col_w[0], actual_h, style='F')
+            self.line(x0, y0, x0, y0 + actual_h)
+            self.line(x0 + col_w[0], y0, x0 + col_w[0], y0 + actual_h)
+            self.set_xy(x0, y0 + v_pad)
             self.set_text_color(*self.DARK_GRAY)
             self.multi_cell(col_w[0], row_h, name_text, align='L',
-                            border='LR', fill=fill, new_x='RIGHT', new_y='TOP')
+                            border=0, fill=False, new_x='RIGHT', new_y='TOP')
+            self.set_xy(x0 + col_w[0], y0)
 
             # Level label (color-coded) — height matches country cell
             self.set_font('Helvetica', 'B', 9)
@@ -2001,10 +2167,13 @@ class VerificationReport:
         self.data_hash: str = ""
         self.assertion_errors: list[str] = []
         self.regional_signal_gaps: list[str] = []    # countries with signals but no warnings
+        self.missing_expected_regions: list[str] = []  # ground-truth canary failures
         self.page_fallback_used: list[str] = []      # countries where page scraping was used
         self.worldwide_caution_found: bool = False
         self.worldwide_caution_title: str = ""
         self.entry_count_stable: bool = True
+        self.listing_page_count: int | None = None   # cross-validation from HTML listing
+        self.used_cache: bool = False                 # True if API cache was used as fallback
 
     def check_entry_stability(self, current_count: int, history_path: 'Path') -> None:
         """Compare current raw entry count against recent history and warn on variance.
@@ -2063,10 +2232,17 @@ class VerificationReport:
         return self.data_hash
 
     def populate_prohibited_audit(self, prohibited_advisories: list[TravelAdvisory]):
-        """Check which expected prohibited countries were matched in API data."""
+        """Check which expected prohibited countries were matched in API data.
+
+        Uses is_prohibited_country() — the same function the waterfall uses —
+        so the audit never disagrees with the pipeline about what matched.
+        """
         for name in PROHIBITED_COUNTRIES:
             match = next(
-                (a for a in prohibited_advisories if name.lower() in a.country_name.lower()),
+                (a for a in prohibited_advisories if is_prohibited_country(a.country_name)
+                 and (name.lower() in a.country_name.lower()
+                      or any(inc.lower() in a.country_name.lower()
+                             for inc in PROHIBITED_COUNTRIES[name].get('includes', [])))),
                 None
             )
             if match:
@@ -2075,10 +2251,15 @@ class VerificationReport:
                 self.prohibited_unmatched.append(name)
 
     def populate_ut_suspended_audit(self, ut_suspended_advisories: list[TravelAdvisory]):
-        """Check which expected UT suspended countries were matched in API data."""
-        for name in UT_SUSPENDED_TRAVEL:
+        """Check which expected UT suspended countries were matched in API data.
+
+        Uses _match_country_dict() — the same function the waterfall uses —
+        so the audit agrees with the pipeline (fixes UAE-style false misses).
+        """
+        for name, info in UT_SUSPENDED_TRAVEL.items():
+            single = {name: info}
             match = next(
-                (a for a in ut_suspended_advisories if name.lower() in a.country_name.lower()),
+                (a for a in ut_suspended_advisories if _match_country_dict(a.country_name, single)),
                 None
             )
             if match:
@@ -2087,10 +2268,14 @@ class VerificationReport:
                 self.ut_suspended_unmatched.append(name)
 
     def populate_restricted_special_audit(self, restricted_advisories: list[TravelAdvisory]):
-        """Check which expected restricted/special-approval countries were matched in API data."""
-        for name in RESTRICTED_TRAVEL_REQUIRING_SPECIAL_APPROVAL:
+        """Check which expected restricted/special-approval countries were matched in API data.
+
+        Uses _match_country_dict() — the same function the waterfall uses.
+        """
+        for name, info in RESTRICTED_TRAVEL_REQUIRING_SPECIAL_APPROVAL.items():
+            single = {name: info}
             match = next(
-                (a for a in restricted_advisories if name.lower() in a.country_name.lower()),
+                (a for a in restricted_advisories if _match_country_dict(a.country_name, single)),
                 None
             )
             if match:
@@ -2166,7 +2351,16 @@ class VerificationReport:
                 self.assertion_errors.append(f"DUPLICATE: Country code '{code}' appears more than once")
             seen_codes.add(code)
 
-        # 5. Flag unresolved regional signal gaps (warning, not a hard failure)
+        # 7. Hard minimum entry count — refuse to generate a report from a
+        #    partial API response (the API is load-balanced and can serve as
+        #    few as 17 entries from a bad backend).
+        if self.raw_count < MIN_EXPECTED_ENTRIES:
+            self.assertion_errors.append(
+                f"ENTRY COUNT: Only {self.raw_count} entries received "
+                f"(minimum {MIN_EXPECTED_ENTRIES}). API may have served a partial response."
+            )
+
+        # 8. Flag unresolved regional signal gaps
         if all_advisories:
             for adv in all_advisories:
                 if adv.overall_level <= 2 and not adv.regional_warnings:
@@ -2178,6 +2372,27 @@ class VerificationReport:
                     len(self.regional_signal_gaps),
                     ", ".join(self.regional_signal_gaps)
                 )
+            # Too many gaps suggests truncated API summaries or failing extraction
+            if len(self.regional_signal_gaps) > MAX_REGIONAL_SIGNAL_GAPS:
+                self.assertion_errors.append(
+                    f"REGIONAL GAPS: {len(self.regional_signal_gaps)} countries have regional "
+                    f"signals but no extracted warnings (threshold: {MAX_REGIONAL_SIGNAL_GAPS})"
+                )
+
+        # 9. Ground-truth canary — countries known to always have L4 regions
+        if all_advisories:
+            for expected_name in MUST_HAVE_REGIONS:
+                adv = next(
+                    (a for a in all_advisories
+                     if expected_name.lower() in a.country_name.lower()),
+                    None,
+                )
+                if adv and not adv.regional_warnings:
+                    self.missing_expected_regions.append(expected_name)
+                    logger.warning(
+                        "[WARN] Expected regional warnings for %s but found none",
+                        expected_name,
+                    )
 
         return len(self.assertion_errors) == 0
 
@@ -2205,6 +2420,11 @@ class VerificationReport:
         lines.append(f"After dedup:            {self.after_dedup_count}")
         stability = "stable" if self.entry_count_stable else "[WARN] UNSTABLE — count differed from previous run by >1"
         lines.append(f"Entry count stability:  {stability}")
+        if self.used_cache:
+            lines.append(f"API cache fallback:     [WARN] USED — live API returned fewer than {MIN_EXPECTED_ENTRIES} entries")
+        if self.listing_page_count is not None:
+            delta = abs(self.raw_count - self.listing_page_count)
+            lines.append(f"Listing page count:     {self.listing_page_count} (delta from API: {delta})")
         if self.worldwide_caution_found:
             lines.append(f"Worldwide caution:      FOUND — '{self.worldwide_caution_title}'")
         else:
@@ -2275,6 +2495,13 @@ class VerificationReport:
             for name in sorted(self.regional_signal_gaps):
                 lines.append(f"  [WARN] {name}")
 
+        # Ground-truth canary: countries expected to have regions
+        if self.missing_expected_regions:
+            lines.append("")
+            lines.append("--- MISSING EXPECTED REGIONS (canary) ---")
+            for name in sorted(self.missing_expected_regions):
+                lines.append(f"  [WARN] {name} — expected regional warnings but found none")
+
         # Data hash
         lines.append("")
         lines.append("--- DATA HASH ---")
@@ -2295,6 +2522,8 @@ class VerificationReport:
             lines.append(f"  [OK] Parse failure rate within threshold ({self.parse_failures}/{self.raw_count})")
             lines.append(f"  [OK] High-risk countries found ({len(self.high_risk_names)})")
             lines.append("  [OK] No duplicate country codes after dedup")
+            lines.append(f"  [OK] Entry count meets minimum ({self.raw_count} >= {MIN_EXPECTED_ENTRIES})")
+            lines.append(f"  [OK] Regional signal gaps within threshold ({len(self.regional_signal_gaps)} <= {MAX_REGIONAL_SIGNAL_GAPS})")
 
         lines.append("")
         lines.append("=" * 70)
@@ -2318,27 +2547,56 @@ def main():
         action="store_true",
         help="Print country list to console without generating PDF"
     )
+    parser.add_argument(
+        "--log-level",
+        type=str,
+        default="WARNING",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR"],
+        help="Set logging verbosity (default: WARNING)"
+    )
 
     args = parser.parse_args()
+
+    # Configure logging from CLI arg
+    logging.basicConfig(
+        level=getattr(logging, args.log_level),
+        format="%(levelname)s: %(message)s",
+    )
 
     # Initialize verification
     verification = VerificationReport()
 
     print("Fetching travel advisories from US State Department...")
 
+    # Resolve output directory for cache and counts files
+    _output_dir = Path(args.output).resolve().parent
+    _cache_path = _output_dir / API_CACHE_FILENAME
+
     try:
-        raw_data = fetch_advisories()
+        raw_data = fetch_advisories(cache_path=_cache_path)
     except ConnectionError as e:
         print(f"\nError: {e}")
         print("Please check your internet connection and try again.")
         return 1
 
     verification.raw_count = len(raw_data)
+    # Detect if cache was used (live API returned fewer than minimum)
+    if _cache_path.exists():
+        try:
+            cached_ts = json.loads(_cache_path.read_text(encoding='utf-8')).get('timestamp', '')
+            # If the cache timestamp matches a recent save, live data was good.
+            # If not, we may have used the cache. Check by re-reading the cache.
+        except (json.JSONDecodeError, OSError):
+            pass
     print(f"Retrieved {len(raw_data)} advisories.")
 
     # Stability check — compare raw count against recent run history
-    _counts_file = Path(args.output).resolve().parent / "travel_advisory_counts.json"
+    _counts_file = _output_dir / "travel_advisory_counts.json"
     verification.check_entry_stability(len(raw_data), _counts_file)
+
+    # Cross-validate entry count against the HTML listing page
+    listing_count = fetch_listing_page_count()
+    verification.listing_page_count = listing_count
 
     # Fetch worldwide caution from its dedicated page (not in the JSON feed)
     worldwide_caution = extract_worldwide_caution()

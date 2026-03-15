@@ -36,6 +36,8 @@ Desktop.ini
 *.pdf
 *.verification.txt
 *.counts.json
+travel_advisory_cache.json
+travel_advisory_counts.json
 
 # Node (in case any tooling is added later)
 node_modules/
