@@ -28,6 +28,12 @@ logger = logging.getLogger(__name__)
 # State Department API endpoint
 API_URL = "https://cadataapi.state.gov/api/TravelAdvisories"
 
+# Dedicated worldwide caution page (not in the JSON feed)
+WORLDWIDE_CAUTION_URL = (
+    "https://travel.state.gov/en/international-travel/"
+    "travel-advisories/global-events/worldwide-caution.html"
+)
+
 # Advisory level definitions
 LEVEL_NAMES = {
     1: "Exercise Normal Precautions",
@@ -39,6 +45,20 @@ LEVEL_NAMES = {
 # =============================================================================
 # PROHIBITED COUNTRIES - Texas Executive Order GA-48
 # =============================================================================
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+# MANUAL MAINTENANCE REQUIRED
+# This list must be kept in sync with 15 CFR 791.4(a) — the official list of
+# US Department of Commerce "foreign adversary" designations.  It is NOT
+# auto-populated from any API.
+#
+# To verify/update:
+#   1. Visit: https://www.ecfr.gov/current/title-15/subtitle-B/chapter-VII/
+#             subchapter-E/part-791/subpart-A/section-791.4
+#   2. Compare § 791.4(a) with the keys below.
+#   3. Add or remove countries (with code, includes, official_name) as needed.
+#   4. Commit the change with a reference to the eCFR amendment date.
+# !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+#
 # Per 15 CFR 791.4, the following are designated as "foreign adversaries" by
 # the US Department of Commerce. Texas EO GA-48 prohibits state employees from
 # work-related travel to these countries.
@@ -278,10 +298,11 @@ def _total_summary_length(entries: list[dict]) -> int:
 def fetch_advisories(max_retries: int = 3) -> list[dict]:
     """Fetch travel advisory data from the State Department API.
 
-    The API occasionally returns truncated Summary fields that omit regional
-    warning details.  To mitigate this, the fetch is retried up to
-    *max_retries* times and the response with the most total summary data is
-    kept.
+    The API is load-balanced across backends that can disagree on both entry
+    count and summary content.  All attempts are made and the response is
+    selected by:
+      1. Most entries (primary) — a higher count means fewer missing advisories.
+      2. Total summary length (tiebreaker) — richer text when counts are equal.
 
     Returns:
         List of advisory dictionaries from the API.
@@ -303,10 +324,13 @@ def fetch_advisories(max_retries: int = 3) -> list[dict]:
                 data = json.loads(response.read().decode('utf-8'))
                 entries = data if isinstance(data, list) else data.get('data', [])
                 size = _total_summary_length(entries)
-                if size > best_size:
+                logger.debug("Fetch attempt %d: %d entries, %d total summary chars",
+                             attempt + 1, len(entries), size)
+                # Prefer more entries; use summary length as tiebreaker only.
+                if len(entries) > len(best) or (
+                    len(entries) == len(best) and size > best_size
+                ):
                     best, best_size = entries, size
-                    logger.debug("Fetch attempt %d: %d entries, %d total summary chars",
-                                 attempt + 1, len(entries), size)
         except (urllib.error.URLError, json.JSONDecodeError, OSError) as e:
             last_error = e
             logger.debug("Fetch attempt %d failed: %s", attempt + 1, e)
@@ -907,12 +931,101 @@ def filter_high_risk(
         if advisory.has_regional_elevation and advisory.max_regional_level >= 3:
             high_risk.append(advisory)
 
+    # Consolidate: at most one advisory per canonical PROHIBITED_COUNTRIES key.
+    # Prefer the advisory whose name matches the parent key (e.g. "China") over
+    # an include match (e.g. "Hong Kong"). Discards duplicate includes.
+    _by_key: dict[str, tuple[bool, TravelAdvisory]] = {}
+    for adv in prohibited:
+        name_lower = adv.country_name.lower()
+        for key, info in PROHIBITED_COUNTRIES.items():
+            is_parent = key.lower() in name_lower
+            is_include = any(inc.lower() in name_lower for inc in info.get('includes', []))
+            if not (is_parent or is_include):
+                continue
+            existing = _by_key.get(key)
+            if existing is None or (is_parent and not existing[0]):
+                _by_key[key] = (is_parent, adv)
+            break
+    prohibited = [adv for _, adv in _by_key.values()]
+
     prohibited.sort(key=lambda a: a.country_name)
     ut_suspended.sort(key=lambda a: a.country_name)
     restricted_special.sort(key=lambda a: a.country_name)
     high_risk.sort(key=lambda a: (-a.overall_level, -a.max_regional_level, a.country_name))
 
     return prohibited, ut_suspended, restricted_special, high_risk
+
+
+def extract_worldwide_caution() -> 'TravelAdvisory | None':
+    """Fetch the worldwide caution advisory from the dedicated State Dept page.
+
+    Parses the HTML at WORLDWIDE_CAUTION_URL, extracting the date and body text
+    from <div class="pageContent"> blocks.  Returns None (with a logged warning)
+    if the page is unreachable or contains no usable text.
+    """
+    try:
+        req = urllib.request.Request(
+            WORLDWIDE_CAUTION_URL,
+            headers={"User-Agent": "Mozilla/5.0 (travel-advisory-report/1.0)"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw_html = resp.read().decode("utf-8", errors="replace")
+    except Exception as exc:
+        logger.warning("Could not fetch worldwide caution page: %s", exc)
+        return None
+
+    # Extract all pageContent div bodies
+    blocks = re.findall(
+        r'<div[^>]+class="pageContent"[^>]*>(.*?)</div>',
+        raw_html,
+        re.DOTALL,
+    )
+    if not blocks:
+        logger.warning("Worldwide caution page fetched but no pageContent divs found.")
+        return None
+
+    def _strip_html(fragment: str) -> str:
+        """Remove HTML tags and decode entities; collapse whitespace."""
+        text = re.sub(r'<[^>]+>', ' ', fragment)
+        text = html.unescape(text)
+        return re.sub(r'\s+', ' ', text).strip()
+
+    # Block 0 contains the date line; remaining blocks are body text.
+    date_text = _strip_html(blocks[0])
+    body_text = "\n\n".join(_strip_html(b) for b in blocks[1:] if _strip_html(b))
+
+    if not body_text:
+        logger.warning("Worldwide caution page contained no body text.")
+        return None
+
+    # Extract issue date from the date block (e.g. "February 28, 2026 - ...")
+    date_match = re.search(r'(\w+ \d{1,2}, \d{4})', date_text)
+    last_updated: datetime | None = None
+    if date_match:
+        try:
+            last_updated = datetime.strptime(date_match.group(1), "%B %d, %Y")
+        except ValueError:
+            pass
+    if last_updated is None:
+        last_updated = datetime.now()
+
+    # Infer advisory level from body text keywords (worldwide caution is typically L2)
+    body_lower = body_text.lower()
+    if "do not travel" in body_lower:
+        level = 4
+    elif "reconsider travel" in body_lower:
+        level = 3
+    else:
+        level = 2  # "exercise increased caution" or unspecified
+
+    return TravelAdvisory(
+        country_name="Worldwide Caution",
+        country_code="WW",
+        overall_level=level,
+        summary=body_text,
+        last_updated=last_updated,
+        link=WORLDWIDE_CAUTION_URL,
+    )
 
 
 # Canonical risk factor keywords, ordered by severity (most severe first).
@@ -1207,89 +1320,189 @@ class TravelAdvisoryPDF(FPDF):
         """Create the report title page with summary statistics."""
         self.add_page()
 
-        # Title
-        self.ln(30)
-        self.set_font('Helvetica', 'B', 28)
+        # --- Title block ---
+        # Top NAVY rule
+        self.set_draw_color(*self.NAVY)
+        self.set_line_width(0.8)
+        self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
+        self.ln(6)
+
+        # Report title
+        self.set_x(self.l_margin)
+        self.set_font('Helvetica', 'B', 22)
         self.set_text_color(*self.NAVY)
-        self.cell(0, 15, 'Travel Advisory Report', align='C')
-        self.ln(12)
+        self.cell(self.epw, 10, 'TRAVEL ADVISORY REPORT', align='C')
+        self.ln(10 + 3)
 
         # Subtitle
-        self.set_font('Helvetica', '', 14)
+        self.set_x(self.l_margin)
+        self.set_font('Helvetica', '', 12)
         self.set_text_color(*self.MEDIUM_GRAY)
-        self.cell(0, 8, 'High-Risk Destinations Subject to ITOC Review', align='C')
-        self.ln(8)
+        self.cell(self.epw, 6, 'High-Risk Destinations Subject to ITOC Review', align='C')
+        self.ln(6 + 3)
 
-        self.ln(20)
+        # Generated date
+        self.set_x(self.l_margin)
+        self.set_font('Helvetica', 'I', 9)
+        self.set_text_color(*self.MEDIUM_GRAY)
+        self.cell(self.epw, 5, f'Generated: {datetime.now().strftime("%B %d, %Y at %H:%M")}', align='C')
+        self.ln(5 + 6)
 
-        # Generation date
-        self.set_font('Helvetica', '', 11)
-        self.set_text_color(*self.DARK_GRAY)
-        self.cell(0, 6, f'Generated: {datetime.now().strftime("%B %d, %Y at %H:%M")}', align='C')
-        self.ln(25)
+        # Bottom NAVY rule
+        self.set_draw_color(*self.NAVY)
+        self.set_line_width(0.8)
+        self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
+        self.ln(10)
 
-        # Statistics box
-        self.set_fill_color(*self.LIGHT_GRAY)
-        box_x = 40
-        box_width = self.epw - 40
-        self.set_x(box_x)
-        self.set_font('Helvetica', 'B', 12)
+        # --- PURPOSE section ---
+        self.set_x(self.l_margin)
+        self.set_font('Helvetica', 'B', 14)
         self.set_text_color(*self.NAVY)
-        self.cell(box_width, 10, 'Summary', fill=True, align='C')
-        self.ln(12)
+        self.cell(self.epw, 5, 'PURPOSE', align='C')
+        self.ln(5 + 3)
 
-        # Stats bulleted list
+        intro_margin = 20
+        intro_w = self.w - 2 * intro_margin
+        intro = (
+            'This report identifies international destinations requiring Institutional Travel '
+            'Oversight Committee (ITOC) review under UT System travel policy and Texas Executive '
+            'Order GA-48. Destinations are categorized by risk level based on US State Department '
+            'travel advisories, UT System travel suspensions, and federal foreign adversary '
+            'designations. All travel to listed destinations, including layovers and connections, '
+            'must follow the approval requirements outlined herein.'
+        )
+        self.set_x(intro_margin)
+        self.set_font('Helvetica', '', 10)
+        self.set_text_color(*self.DARK_GRAY)
+        self.multi_cell(intro_w, 6, self._clean_text(intro), align='J',
+                        new_x='LMARGIN', new_y='NEXT')
+        self.ln(10)
+
+        # --- SUMMARY section ---
+        self.set_x(self.l_margin)
+        self.set_font('Helvetica', 'B', 14)
+        self.set_text_color(*self.NAVY)
+        self.cell(self.epw, 5, 'SUMMARY', align='C')
+        self.ln(5)
+        self.set_draw_color(*self.LIGHT_GRAY)
+        self.set_line_width(0.3)
+        self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
+        self.ln(4)
+
+        # --- Category list (20mm side margins) ---
         EO_URL = (
             'https://gov.texas.gov/uploads/files/press/EO-GA-48_Hardening'
             '_State_Government_FINAL_11-19-2024.pdf'
         )
-        bullet_x = 15
-        text_x = 22
-        text_w = self.epw - (text_x - 10)
-        line_h = 7
+        cat_left = 20           # mm left margin
+        cat_right = 20          # mm right margin
+        cat_w = self.w - cat_left - cat_right
+        desc_indent = 4         # mm extra indent for description
+        desc_x = cat_left + desc_indent
+        desc_w = cat_w - desc_indent
+        name_h = 6              # line height for category name row
+        desc_h = 5              # line height for description row
+        cat_gap = 5             # mm between categories
 
-        # Each entry: (text_before_link, link_label_or_None, link_url_or_None)
-        bullets = [
-            (f"PROHIBITED (EO GA-48) ({stats.get('prohibited', 0)}): "
-             f"Designated foreign adversaries; travel subject to ",
-             'EO GA-48', EO_URL),
-            (f"UT Suspended ({stats.get('ut_suspended', 0)}): "
-             f"Active suspension incl. layovers; ITOC + President approval required",
+        # (cat_name, count, description, link_label, link_url)
+        categories = [
+            ('PROHIBITED (EO GA-48)', stats.get('prohibited', 0),
+             'Designated foreign adversaries; travel subject to ', 'EO GA-48', EO_URL),
+            ('UT SUSPENDED', stats.get('ut_suspended', 0),
+             'Active suspension including layovers; ITOC and University President approval required',
              None, None),
-            (f"Restricted - Elevated Approval ({stats.get('restricted', 0)}): "
-             f"ITOC + President approval required prior to booking, incl. layovers",
+            ('RESTRICTED \u2014 ELEVATED APPROVAL', stats.get('restricted', 0),
+             'ITOC and University President approval required prior to booking, including layovers',
              None, None),
-            (f"Level 4 - Do Not Travel ({stats.get('level_4', 0)}): "
-             f"Designated Area of High Risk; State Dept advises against all travel; ITOC review approval required",
+            ('LEVEL 4 \u2014 DO NOT TRAVEL', stats.get('level_4', 0),
+             'Designated Area of High Risk; State Dept advises against all travel; ITOC review required',
              None, None),
-            (f"Level 3 - Reconsider Travel ({stats.get('level_3', 0)}): "
-             f"Designated Area of High Risk; State Dept advises reconsidering travel due to serious risks; ITOC review approval required",
+            ('LEVEL 3 \u2014 RECONSIDER TRAVEL', stats.get('level_3', 0),
+             'Designated Area of High Risk; State Dept advises reconsidering travel; ITOC review required',
              None, None),
-            (f"Regional Warnings ({stats.get('regional', 0)}): "
-             f"Contains Level 3/4 regions despite lower overall country rating",
+            ('REGIONAL WARNINGS', stats.get('regional', 0),
+             'Contains Level 3/4 regions despite lower overall country rating',
              None, None),
-            (f"Total Unique Entries ({stats.get('total', 0)})",
-             None, None),
+            ('TOTAL UNIQUE ENTRIES', stats.get('total', 0), None, None, None),
         ]
 
+        for i, (cat_name, count, description, link_label, link_url) in enumerate(categories):
+            if i > 0:
+                self.ln(cat_gap)
+
+            # Category name (bold 11pt DARK_GRAY, left) + count (bold 11pt NAVY, right)
+            self.set_x(cat_left)
+            self.set_font('Helvetica', 'B', 11)
+            self.set_text_color(*self.DARK_GRAY)
+            self.cell(cat_w - 15, name_h, self._clean_text(cat_name), align='L')
+            self.set_text_color(*self.NAVY)
+            self.cell(15, name_h, str(count), align='R')
+            self.ln(name_h)
+
+            # Description (italic 9pt MEDIUM_GRAY, indented 4mm)
+            if description:
+                self.set_x(desc_x)
+                self.set_font('Helvetica', 'I', 9)
+                self.set_text_color(*self.MEDIUM_GRAY)
+                if link_label:
+                    self.write(desc_h, self._clean_text(description))
+                    self.set_text_color(0, 76, 151)
+                    self.write(desc_h, link_label, link=link_url)
+                    self.set_text_color(*self.MEDIUM_GRAY)
+                else:
+                    self.cell(desc_w, desc_h, self._clean_text(description), align='L')
+                self.ln(desc_h)
+
+            # Subtle rule between categories (not after last)
+            if description is not None:  # skip rule after TOTAL UNIQUE ENTRIES
+                self.ln(1)
+                self.set_draw_color(*self.LIGHT_GRAY)
+                self.set_line_width(0.1)
+                self.line(cat_left, self.get_y(), self.w - cat_right, self.get_y())
+
+    def add_worldwide_caution_page(self, caution: TravelAdvisory) -> None:
+        """Render the worldwide caution advisory on a dedicated page.
+
+        Appears as page 2, immediately before the quick reference table.
+        Uses a prominent LEVEL_2_COLOR header band so it is immediately visible.
+        """
+        self.add_page()
+
+        # Full-width header band
+        band_h = 16
+        self.set_fill_color(*self.LEVEL_2_COLOR)
+        self.rect(0, self.t_margin, self.w, band_h, style='F')
+        self.set_xy(0, self.t_margin)
+        self.set_font('Helvetica', 'B', 14)
+        self.set_text_color(255, 255, 255)
+        self.cell(self.w, band_h, 'WORLDWIDE CAUTION - US State Department', align='C')
+        self.ln(band_h + 5)
+
+        # Level and date
+        level_name = LEVEL_NAMES.get(caution.overall_level, '')
+        level_str = f'Level {caution.overall_level}: {level_name}' if level_name else f'Level {caution.overall_level}'
+        date_str = caution.last_updated.strftime('%B %d, %Y')
+        self.set_x(self.l_margin)
+        self.set_font('Helvetica', 'B', 10)
+        self.set_text_color(*self.DARK_GRAY)
+        self.cell(self.epw * 0.5, 6, level_str, align='L')
+        self.set_font('Helvetica', 'I', 10)
+        self.set_text_color(*self.MEDIUM_GRAY)
+        self.cell(self.epw * 0.5, 6, f'Updated: {date_str}', align='R')
+        self.ln(10)
+
+        # Thin rule
+        self.set_draw_color(*self.LIGHT_GRAY)
+        self.set_line_width(0.3)
+        self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
+        self.ln(6)
+
+        # Summary body
+        self.set_x(self.l_margin)
         self.set_font('Helvetica', '', 10)
         self.set_text_color(*self.DARK_GRAY)
-
-        for text, link_label, link_url in bullets:
-            self.set_x(bullet_x)
-            self.cell(text_x - bullet_x, line_h, '-')
-            if link_label:
-                self.set_x(text_x)
-                self.write(line_h, self._clean_text(text))
-                self.set_text_color(0, 76, 151)
-                self.write(line_h, link_label, link=link_url)
-                self.set_text_color(*self.DARK_GRAY)
-                self.ln(line_h)
-            else:
-                self.set_x(text_x)
-                self.multi_cell(text_w, line_h, self._clean_text(text),
-                                new_x='LMARGIN', new_y='NEXT')
-            self.ln(4)
+        self.multi_cell(self.epw, 6, self._clean_text(caution.summary), align='J',
+                        new_x='LMARGIN', new_y='NEXT')
 
     def add_prohibited_section(self, prohibited_advisories: list[TravelAdvisory]):
         """Add the prohibited countries section (Texas EO GA-48)."""
@@ -1510,40 +1723,31 @@ class TravelAdvisoryPDF(FPDF):
         self.cell(0, 10, 'Quick Reference - Countries by Risk Level', align='C')
         self.ln(12)
 
-        # Tier definitions printed above the table
-        tier_defs = [
-            (self.PROHIBITED_COLOR,
-             'PROHIBITED (Texas EO GA-48):',
-             'Travel is prohibited for UT employees per Texas Executive Order GA-48 '
-             'designating these countries as foreign adversaries.'),
-            (self.UT_SUSPENDED_COLOR,
-             'UT SUSPENDED:',
-             'UT System travel is suspended to or through these countries, including layovers '
-             'and connections. Exceptions require approval from both the Institutional Oversight '
-             'Committee (ITOC) and the University President.'),
-            (self.RESTRICTED_SPECIAL_COLOR,
-             'RESTRICTED - ELEVATED APPROVAL:',
-             'Travel to or through these countries, including layovers and connections, requires '
-             'Institutional Travel Oversight Committee (ITOC) and University President approval before booking.'),
-        ]
-        for color, heading, definition in tier_defs:
-            self.set_font('Helvetica', 'B', 9)
-            self.set_text_color(*color)
-            self.cell(0, 5, heading)
-            self.ln(5)
-            self.set_font('Helvetica', 'I', 8)
-            self.set_text_color(*self.DARK_GRAY)
-            self.multi_cell(0, 4, self._clean_text(definition),
-                            new_x='LMARGIN', new_y='NEXT')
-            self.ln(2)
-        self.ln(3)
-
         # Build sorted row list: (advisory, label, color, notes)
         rows: list[tuple[TravelAdvisory, str, tuple, str]] = []
 
-        # Prohibited countries first (alphabetical)
-        for adv in sorted(prohibited, key=lambda a: a.country_name):
-            rows.append((adv, 'PROHIBITED', self.PROHIBITED_COLOR, 'EO GA-48'))
+        # Prohibited countries — iterate canonical dict so includes are shown
+        for key, info in sorted(PROHIBITED_COUNTRIES.items()):
+            matched = next(
+                (a for a in prohibited
+                 if key.lower() in a.country_name.lower()
+                 or (info.get('code') and info['code'].upper() == a.country_code.upper())),
+                None,
+            )
+            if matched is None:
+                continue
+            display_name = key
+            if info.get('includes'):
+                display_name += f" (incl. {', '.join(info['includes'])})"
+            stub = TravelAdvisory(
+                country_name=display_name,
+                country_code=info.get('code', matched.country_code),
+                overall_level=matched.overall_level,
+                summary='',
+                last_updated=matched.last_updated,
+                link=matched.link,
+            )
+            rows.append((stub, 'PROHIBITED', self.PROHIBITED_COLOR, 'EO GA-48'))
 
         # UT Suspended countries — iterate the policy dict so all entries always appear,
         # regardless of whether the State Dept API returned a matching advisory.
@@ -1555,7 +1759,10 @@ class TravelAdvisoryPDF(FPDF):
             if info.get('includes'):
                 display_name += f" (incl. {', '.join(info['includes'])})"
             matched = next(
-                (a for a in ut_suspended if name.lower() in a.country_name.lower()), None
+                (a for a in ut_suspended
+                 if name.lower() in a.country_name.lower()
+                 or (info.get('code') and info['code'].upper() == a.country_code.upper())),
+                None,
             )
             stub = TravelAdvisory(
                 country_name=display_name,
@@ -1660,7 +1867,7 @@ class TravelAdvisoryPDF(FPDF):
             # Draw country cell (wraps long names)
             self.set_xy(x0, y0)
             self.set_text_color(*self.DARK_GRAY)
-            self.multi_cell(col_w[0], row_h, name_text,
+            self.multi_cell(col_w[0], row_h, name_text, align='L',
                             border='LR', fill=fill, new_x='RIGHT', new_y='TOP')
 
             # Level label (color-coded) — height matches country cell
@@ -1712,6 +1919,7 @@ def create_report(
     restricted_special: list[TravelAdvisory],
     advisories: list[TravelAdvisory],
     output_path: Path,
+    worldwide_caution: 'TravelAdvisory | None' = None,
 ) -> Path:
     """Generate the PDF report.
 
@@ -1721,6 +1929,7 @@ def create_report(
         restricted_special: List of advisories requiring Institutional Travel Oversight Committee (ITOC) + President approval.
         advisories: List of general high-risk advisories to include.
         output_path: Where to save the PDF.
+        worldwide_caution: Optional worldwide caution advisory to render on page 2.
 
     Returns:
         Path to the generated PDF.
@@ -1741,6 +1950,10 @@ def create_report(
 
     # Title page with statistics
     pdf.add_title_page(stats)
+
+    # Worldwide caution page (page 2) — only rendered when present in API data
+    if worldwide_caution is not None:
+        pdf.add_worldwide_caution_page(worldwide_caution)
 
     # Unified quick-reference table (prohibited + ut_suspended + restricted + high-risk)
     pdf.add_summary_section(prohibited, ut_suspended, restricted_special, advisories)
@@ -1789,6 +2002,56 @@ class VerificationReport:
         self.assertion_errors: list[str] = []
         self.regional_signal_gaps: list[str] = []    # countries with signals but no warnings
         self.page_fallback_used: list[str] = []      # countries where page scraping was used
+        self.worldwide_caution_found: bool = False
+        self.worldwide_caution_title: str = ""
+        self.entry_count_stable: bool = True
+
+    def check_entry_stability(self, current_count: int, history_path: 'Path') -> None:
+        """Compare current raw entry count against recent history and warn on variance.
+
+        Reads/updates a JSON history file (last 5 runs) in the output directory.
+        Sets entry_count_stable = False and logs a warning if the count differs
+        from the previous run by more than 1.  Never raises — instability is
+        warn-only.
+        """
+        _HISTORY_MAX = 5
+        history: list[dict] = []
+
+        if history_path.exists():
+            try:
+                history = json.loads(history_path.read_text(encoding='utf-8'))
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning("Could not read entry count history: %s", exc)
+
+        if history:
+            prev_count = history[-1].get('count', current_count)
+            delta = abs(current_count - prev_count)
+            if delta > 1:
+                self.entry_count_stable = False
+                logger.warning(
+                    "[WARN] Entry count changed by %d (prev=%d, now=%d) — "
+                    "API backend variance detected.",
+                    delta, prev_count, current_count,
+                )
+
+        history.append({
+            'timestamp': datetime.now().isoformat(timespec='seconds'),
+            'count': current_count,
+        })
+        history = history[-_HISTORY_MAX:]
+
+        try:
+            history_path.write_text(
+                json.dumps(history, indent=2), encoding='utf-8'
+            )
+        except OSError as exc:
+            logger.warning("Could not write entry count history: %s", exc)
+
+    def record_worldwide_caution(self, adv: 'TravelAdvisory | None') -> None:
+        """Record whether a worldwide caution advisory was found in the API data."""
+        if adv is not None:
+            self.worldwide_caution_found = True
+            self.worldwide_caution_title = adv.country_name
 
     def compute_data_hash(self, advisories: list[TravelAdvisory]) -> str:
         """Compute a SHA-256 fingerprint of the processed advisory data."""
@@ -1940,6 +2203,12 @@ class VerificationReport:
             for desc in self.duplicate_descriptions:
                 lines.append(f"  - {desc}")
         lines.append(f"After dedup:            {self.after_dedup_count}")
+        stability = "stable" if self.entry_count_stable else "[WARN] UNSTABLE — count differed from previous run by >1"
+        lines.append(f"Entry count stability:  {stability}")
+        if self.worldwide_caution_found:
+            lines.append(f"Worldwide caution:      FOUND — '{self.worldwide_caution_title}'")
+        else:
+            lines.append("Worldwide caution:      not found at worldwide caution URL")
 
         # Prohibited audit
         lines.append("")
@@ -2067,6 +2336,14 @@ def main():
     verification.raw_count = len(raw_data)
     print(f"Retrieved {len(raw_data)} advisories.")
 
+    # Stability check — compare raw count against recent run history
+    _counts_file = Path(args.output).resolve().parent / "travel_advisory_counts.json"
+    verification.check_entry_stability(len(raw_data), _counts_file)
+
+    # Fetch worldwide caution from its dedicated page (not in the JSON feed)
+    worldwide_caution = extract_worldwide_caution()
+    verification.record_worldwide_caution(worldwide_caution)
+
     # Parse all advisories, tracking failures
     print("Parsing advisory data...")
     advisories = []
@@ -2111,7 +2388,12 @@ def main():
     _ut_unmatched = [
         n for n in UT_SUSPENDED_TRAVEL
         if not is_prohibited_country(n)
-        and not any(n.lower() in a.country_name.lower() for a in ut_suspended)
+        and not any(
+            n.lower() in a.country_name.lower()
+            or (UT_SUSPENDED_TRAVEL[n].get('code') and
+                UT_SUSPENDED_TRAVEL[n]['code'].upper() == a.country_code.upper())
+            for a in ut_suspended
+        )
     ]
     if _ut_unmatched:
         print(f"  [WARN] No API entry found for: {', '.join(_ut_unmatched)}")
@@ -2192,7 +2474,8 @@ def main():
 
     # Generate PDF
     print(f"\nGenerating PDF report...")
-    create_report(prohibited, ut_suspended, restricted_special, high_risk, output_path)
+    create_report(prohibited, ut_suspended, restricted_special, high_risk, output_path,
+                  worldwide_caution=worldwide_caution)
 
     # Write verification log alongside PDF
     verification.write(verification_path)

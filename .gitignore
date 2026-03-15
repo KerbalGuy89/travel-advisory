@@ -35,6 +35,7 @@ Desktop.ini
 # Output artifacts
 *.pdf
 *.verification.txt
+*.counts.json
 
 # Node (in case any tooling is added later)
 node_modules/
