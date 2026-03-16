@@ -1542,68 +1542,75 @@ class TravelAdvisoryPDF(FPDF):
         self.ln(4)
 
         # --- Category list (20mm side margins) ---
-        EO_URL = (
-            'https://gov.texas.gov/uploads/files/press/EO-GA-48_Hardening'
-            '_State_Government_FINAL_11-19-2024.pdf'
-        )
         cat_left = 20           # mm left margin
         cat_right = 20          # mm right margin
         cat_w = self.w - cat_left - cat_right
-        desc_indent = 4         # mm extra indent for description
-        desc_x = cat_left + desc_indent
-        desc_w = cat_w - desc_indent
+        sq_size = 3             # mm color legend square
+        sq_gap = 2              # mm gap after square
+        sq_offset = sq_size + sq_gap
         name_h = 6              # line height for category name row
-        desc_h = 5              # line height for description row
-        cat_gap = 5             # mm between categories
+        desc_h = 4.5            # line height for description row
+        cat_gap = 3             # mm between categories
 
-        # (cat_name, count, description, link_label, link_url)
+        # (cat_name, count, description, color)
         categories = [
             ('PROHIBITED (EO GA-48)', stats.get('prohibited', 0),
-             'Designated foreign adversaries; travel subject to ', 'EO GA-48', EO_URL),
+             'Designated foreign adversaries per 15 CFR 791.4; work-related travel not '
+             'authorized for state employees under Texas Executive Order GA-48.',
+             self.PROHIBITED_COLOR),
             ('UT SUSPENDED', stats.get('ut_suspended', 0),
-             'Active suspension including layovers; ITOC and University President approval required',
-             None, None),
+             'Active UT System travel suspension; requires ITOC and University President '
+             'approval. Restrictions apply to layovers and connections through these '
+             'countries, not just final destinations.',
+             self.UT_SUSPENDED_COLOR),
             ('RESTRICTED \u2014 ELEVATED APPROVAL', stats.get('restricted', 0),
-             'ITOC and University President approval required prior to booking, including layovers',
-             None, None),
+             'Requires ITOC and University President approval prior to booking. '
+             'Restrictions apply to layovers and connections through these countries, '
+             'not just final destinations.',
+             self.RESTRICTED_SPECIAL_COLOR),
             ('LEVEL 4 \u2014 DO NOT TRAVEL', stats.get('level_4', 0),
-             'Designated Area of High Risk; State Dept advises against all travel; ITOC review required',
-             None, None),
+             'US State Department advises against all travel; designated Area of High '
+             'Risk requiring ITOC review.',
+             self.LEVEL_4_COLOR),
             ('LEVEL 3 \u2014 RECONSIDER TRAVEL', stats.get('level_3', 0),
-             'Designated Area of High Risk; State Dept advises reconsidering travel; ITOC review required',
-             None, None),
+             'US State Department advises reconsidering travel; designated Area of High '
+             'Risk requiring ITOC review.',
+             self.LEVEL_3_COLOR),
             ('REGIONAL WARNINGS', stats.get('regional', 0),
-             'Contains Level 3/4 regions despite lower overall country rating',
-             None, None),
-            ('TOTAL UNIQUE ENTRIES', stats.get('total', 0), None, None, None),
+             'Countries rated Level 1 or 2 overall but containing specific regions '
+             'designated Level 3 or 4. Travelers should consult the Detailed Advisories '
+             'section to verify their itinerary does not include activities in '
+             'elevated-risk regions.',
+             self.LEVEL_2_COLOR),
+            ('TOTAL UNIQUE ENTRIES', stats.get('total', 0), None, self.NAVY),
         ]
 
-        for i, (cat_name, count, description, link_label, link_url) in enumerate(categories):
+        for i, (cat_name, count, description, color) in enumerate(categories):
             if i > 0:
                 self.ln(cat_gap)
 
+            # Color legend square
+            sq_y = self.get_y() + (name_h - sq_size) / 2
+            self.set_fill_color(*color)
+            self.rect(cat_left, sq_y, sq_size, sq_size, style='F')
+
             # Category name (bold 11pt DARK_GRAY, left) + count (bold 11pt NAVY, right)
-            self.set_x(cat_left)
+            self.set_x(cat_left + sq_offset)
             self.set_font('Helvetica', 'B', 11)
             self.set_text_color(*self.DARK_GRAY)
-            self.cell(cat_w - 15, name_h, self._clean_text(cat_name), align='L')
+            self.cell(cat_w - 15 - sq_offset, name_h, self._clean_text(cat_name), align='L')
             self.set_text_color(*self.NAVY)
             self.cell(15, name_h, str(count), align='R')
             self.ln(name_h)
 
-            # Description (italic 9pt MEDIUM_GRAY, indented 4mm)
+            # Description (italic 9pt MEDIUM_GRAY, indented past square)
             if description:
-                self.set_x(desc_x)
+                self.set_x(cat_left + sq_offset)
                 self.set_font('Helvetica', 'I', 9)
                 self.set_text_color(*self.MEDIUM_GRAY)
-                if link_label:
-                    self.write(desc_h, self._clean_text(description))
-                    self.set_text_color(0, 76, 151)
-                    self.write(desc_h, link_label, link=link_url)
-                    self.set_text_color(*self.MEDIUM_GRAY)
-                else:
-                    self.cell(desc_w, desc_h, self._clean_text(description), align='L')
-                self.ln(desc_h)
+                self.multi_cell(cat_w - sq_offset, desc_h,
+                                self._clean_text(description), align='L',
+                                new_x='LMARGIN', new_y='NEXT')
 
             # Subtle rule between categories (not after last)
             if description is not None:  # skip rule after TOTAL UNIQUE ENTRIES
@@ -1981,13 +1988,39 @@ class TravelAdvisoryPDF(FPDF):
         col_w = self._TABLE_COL_W
         row_h = 7
 
+        # Preamble above table (compact italic notes + abbreviation key)
+        preamble_x = self.l_margin
+        preamble_w = self.epw
+        self.set_draw_color(*self.LIGHT_GRAY)
+        self.set_line_width(0.3)
+        self.line(preamble_x, self.get_y(), preamble_x + preamble_w, self.get_y())
+        self.ln(2)
+        self.set_font('Helvetica', 'I', 8)
+        self.set_text_color(*self.MEDIUM_GRAY)
+        self.set_x(preamble_x)
+        self.multi_cell(preamble_w, 3.5, self._clean_text(
+            'Note: Prohibited, UT Suspended, and Restricted designations apply to travel '
+            'through these countries as a layover or connection point, regardless of '
+            'ultimate destination.'
+        ), align='L', new_x='LMARGIN', new_y='NEXT')
+        self.ln(1)
+        self.set_x(preamble_x)
+        self.multi_cell(preamble_w, 3.5, self._clean_text(
+            'EO GA-48 = Texas Executive Order GA-48 (foreign adversaries)  |  '
+            'DNT = Do Not Travel (Level 4 regions)  |  '
+            'RT = Reconsider Travel (Level 3 regions)'
+        ), align='L', new_x='LMARGIN', new_y='NEXT')
+        self.ln(2)
+        self.line(preamble_x, self.get_y(), preamble_x + preamble_w, self.get_y())
+        self.ln(3)
+
         # Draw table header
         self._summary_table_header()
 
         # Draw rows
         for idx, (adv, label, color, notes) in enumerate(rows):
-            # Page break check — leave room for row + footnote
-            if self.get_y() + row_h > self.h - self.b_margin - 20:
+            # Page break check
+            if self.get_y() + row_h > self.h - self.b_margin - 2:
                 self.add_page()
                 self.set_font('Helvetica', 'B', 14)
                 self.set_text_color(*self.NAVY)
@@ -2051,20 +2084,6 @@ class TravelAdvisoryPDF(FPDF):
             self.set_xy(x0, y0 + actual_h)
             self.line(x0, y0 + actual_h, x0 + sum(col_w), y0 + actual_h)
 
-        # Footnote
-        self.ln(6)
-        self.set_draw_color(*self.LIGHT_GRAY)
-        self.line(10, self.get_y(), self.epw + 10, self.get_y())
-        self.ln(4)
-        self.set_font('Helvetica', 'I', 8)
-        self.set_text_color(*self.MEDIUM_GRAY)
-        self.multi_cell(0, 4, self._clean_text(
-            'EO GA-48: Texas Executive Order GA-48 (Nov 2024) prohibits state employee '
-            'work-related travel to countries designated as foreign adversaries per 15 CFR 791.4.\n'
-            'DNT = Do Not Travel (Level 4 regions)  |  RT = Reconsider Travel (Level 3 regions)\n'
-            'Note: Prohibited, UT Suspended, and Restricted designations apply to travel '
-            'through these countries as a layover or connection point, regardless of ultimate destination.'
-        ), align='L')
 
     @staticmethod
     def _regional_notes(adv: TravelAdvisory) -> str:
