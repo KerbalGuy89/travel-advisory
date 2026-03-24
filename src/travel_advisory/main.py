@@ -2436,7 +2436,7 @@ class TravelAdvisoryPDF(FPDF):
                 last_updated=matched.last_updated,
                 link=matched.link,
             )
-            rows.append((stub, 'FOREIGN ADVERSARY', self.PROHIBITED_COLOR, 'EO GA-48; President + EVP Academic Affairs + ITOC req.'))
+            rows.append((stub, 'FOREIGN ADVERSARY', self.PROHIBITED_COLOR, 'President + EVP Academic Affairs + ITOC req.'))
 
         # UT Suspended countries — iterate the policy dict so all entries always appear,
         # regardless of whether the State Dept API returned a matching advisory.
