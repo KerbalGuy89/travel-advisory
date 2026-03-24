@@ -308,6 +308,7 @@ class TravelAdvisory:
     last_updated: datetime
     link: str
     regional_warnings: list[RegionalWarning] = field(default_factory=list)
+    cdc_notices: list['CDCHealthNotice'] = field(default_factory=list)
 
     @property
     def has_regional_elevation(self) -> bool:
@@ -325,6 +326,56 @@ class TravelAdvisory:
     def flag_emoji(self) -> str:
         """Get the flag emoji for this country."""
         return country_code_to_flag(self.country_code)
+
+
+@dataclass
+class CDCHealthNotice:
+    """A CDC Level 3/4 travel health notice for a single country."""
+    country_name: str
+    level: int               # 3 or 4 only
+    level_name: str          # CDC's label, e.g. "Avoid Nonessential Travel"
+    disease: str             # e.g. "Yellow Fever", "Mpox"
+    last_updated: datetime
+    link: str
+
+
+@dataclass
+class CDCGlobalOutbreak:
+    """A CDC Level 1/2 global or multi-country health notice."""
+    title: str               # e.g. "Global Measles"
+    level: int               # 1 or 2
+    level_name: str          # CDC's label
+    disease: str             # normalized disease name
+    affected_summary: str    # e.g. "Multiple regions worldwide"
+    last_updated: datetime
+    link: str                # full URL to the CDC notice page
+
+
+# =============================================================================
+# CDC TRAVEL HEALTH NOTICES
+# =============================================================================
+CDC_NOTICES_URL = "https://wwwnc.cdc.gov/travel/notices"
+
+CDC_LEVEL_NAMES = {
+    1: "Practice Usual Precautions",
+    2: "Practice Enhanced Precautions",
+    3: "Reconsider Nonessential Travel",
+    4: "Avoid All Travel",
+}
+
+# CDC country names that diverge from State Dept naming conventions.
+# Keys are lowercase CDC names; values are State Dept-style names.
+CDC_NAME_MAP: dict[str, str] = {
+    "democratic republic of the congo": "Congo, Democratic Republic of the",
+    "republic of the congo": "Congo, Republic of the",
+    "cote d'ivoire": "Cote d'Ivoire",
+    "côte d'ivoire": "Cote d'Ivoire",
+    "south sudan": "South Sudan",
+    "republic of south sudan": "South Sudan",
+    "timor-leste": "Timor-Leste",
+    "new caledonia": "New Caledonia",
+    "cook islands": "Cook Islands",
+}
 
 
 def _total_summary_length(entries: list[dict]) -> int:
@@ -1180,6 +1231,308 @@ def extract_worldwide_caution() -> 'TravelAdvisory | None':
     )
 
 
+def fetch_cdc_notices() -> tuple[list[CDCHealthNotice], list[CDCGlobalOutbreak]]:
+    """Fetch and parse CDC travel health notices.
+
+    Scrapes https://wwwnc.cdc.gov/travel/notices.
+
+    Returns:
+        Tuple of (health_notices, global_outbreaks) where:
+        - health_notices: Level 3/4 notices for single resolvable countries
+        - global_outbreaks: Level 1/2 global or multi-country notices
+
+    Non-fatal: returns ([], []) on any fetch or parse failure.
+    Logs a warning on failure so the pipeline continues without CDC data.
+    """
+    try:
+        req = urllib.request.Request(
+            CDC_NOTICES_URL,
+            headers={"User-Agent": "TravelAdvisoryReport/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            page_html = resp.read().decode('utf-8', errors='replace')
+    except (urllib.error.URLError, OSError) as exc:
+        logger.warning("Could not fetch CDC travel notices page: %s", exc)
+        return [], []
+
+    health_notices: list[CDCHealthNotice] = []
+    global_outbreaks: list[CDCGlobalOutbreak] = []
+
+    # The page groups notices under level headings.  Each notice is an <a> tag
+    # inside a list item.  We parse the HTML structure to extract level, title,
+    # date, and link for each notice.
+    #
+    # Structure on the page:
+    #   <div ...> or <h3>  containing "Level N"
+    #   followed by <li> blocks with <a href="/travel/notices/levelN/slug">Title</a>
+    #   and a date string nearby.
+
+    # Extract all notice entries with their level from the HTML.
+    # Pattern: link href contains /travel/notices/level{N}/ and link text is title
+    notice_pattern = re.compile(
+        r'<a[^>]+href="(/travel/notices/level(\d)/([^"]+))"[^>]*>\s*(.+?)\s*</a>',
+        re.IGNORECASE | re.DOTALL,
+    )
+    # Date pattern near notices (e.g., "March 16, 2026")
+    date_pattern = re.compile(r'(\w+ \d{1,2}, \d{4})')
+
+    # Split page into chunks around each notice link for date extraction
+    raw_notices: list[dict] = []
+    for match in notice_pattern.finditer(page_html):
+        href = match.group(1)
+        level = int(match.group(2))
+        slug = match.group(3)
+        title = clean_html(match.group(4)).strip()
+
+        # Skip the overview/portal page links
+        if not title or 'travel health notices' in title.lower():
+            continue
+
+        # Build full URL
+        link = f"https://wwwnc.cdc.gov{href}"
+
+        # Find the nearest date after this match
+        after_text = page_html[match.end():match.end() + 300]
+        date_match = date_pattern.search(after_text)
+        last_updated = datetime.now()
+        if date_match:
+            try:
+                last_updated = datetime.strptime(date_match.group(1), "%B %d, %Y")
+            except ValueError:
+                pass
+
+        raw_notices.append({
+            'title': title,
+            'level': level,
+            'slug': slug,
+            'link': link,
+            'last_updated': last_updated,
+        })
+
+    for notice in raw_notices:
+        title = notice['title']
+        level = notice['level']
+        link = notice['link']
+        last_updated = notice['last_updated']
+        level_name = CDC_LEVEL_NAMES.get(level, f"Level {level}")
+
+        # Extract disease and country from title.
+        # Common formats:
+        #   "Yellow Fever in Venezuela"
+        #   "Chikungunya in Mayotte"
+        #   "Global Measles"
+        #   "Global Polio"
+        #   "Clade II Monkeypox in Ghana and Liberia"
+        #   "Rocky Mountain Spotted Fever in Mexico"
+
+        is_global = 'global' in title.lower()
+
+        # Try to split on " in " to get disease and location
+        in_match = re.match(r'^(.+?)\s+in\s+(.+)$', title, re.IGNORECASE)
+        if in_match:
+            disease = in_match.group(1).strip()
+            location = in_match.group(2).strip()
+        else:
+            disease = title
+            location = ""
+
+        # Determine if this is a multi-country notice
+        # Multi-country: title has "Global", or location lists multiple countries
+        # with "and" or commas
+        country_names: list[str] = []
+        if location and not is_global:
+            # Strip parenthetical region details, e.g. "Bolivia (Santa Cruz ...)"
+            location_clean = re.sub(r'\s*\([^)]*\)', '', location)
+            # Split on " and " and commas
+            parts = re.split(r'\s+and\s+|,\s*', location_clean)
+            country_names = [p.strip() for p in parts if p.strip()]
+
+        is_multi_country = is_global or len(country_names) >= 3
+
+        if level >= 3:
+            # Level 3/4: create CDCHealthNotice entries
+            if not is_multi_country and len(country_names) >= 1:
+                # Single or dual country — create one notice per country
+                for cname in country_names:
+                    normalized = CDC_NAME_MAP.get(cname.lower(), cname)
+                    health_notices.append(CDCHealthNotice(
+                        country_name=normalized,
+                        level=level,
+                        level_name=level_name,
+                        disease=disease,
+                        last_updated=last_updated,
+                        link=link,
+                    ))
+            elif is_multi_country or not country_names:
+                # Global or multi-country Level 3/4: try to expand by
+                # fetching the individual notice page
+                expanded = _expand_cdc_notice_countries(link, level, level_name,
+                                                        disease, last_updated)
+                health_notices.extend(expanded)
+        else:
+            # Level 1/2
+            if is_multi_country:
+                # Global or multi-country → CDCGlobalOutbreak
+                affected = location if location else "Multiple regions worldwide"
+                if is_global:
+                    affected = "Multiple regions worldwide"
+                global_outbreaks.append(CDCGlobalOutbreak(
+                    title=title,
+                    level=level,
+                    level_name=level_name,
+                    disease=disease,
+                    affected_summary=affected,
+                    last_updated=last_updated,
+                    link=link,
+                ))
+            # Single-country Level 1/2: discard silently (out of scope)
+
+    logger.info("CDC notices parsed: %d Level 3/4 notices, %d global outbreaks",
+                len(health_notices), len(global_outbreaks))
+    return health_notices, global_outbreaks
+
+
+def _expand_cdc_notice_countries(
+    link: str, level: int, level_name: str, disease: str, last_updated: datetime
+) -> list[CDCHealthNotice]:
+    """Fetch an individual CDC notice page and extract listed countries.
+
+    Used for global/multi-country Level 3/4 notices that need to be expanded
+    into per-country CDCHealthNotice records.
+
+    Returns a list of CDCHealthNotice; empty list on any failure.
+    """
+    try:
+        req = urllib.request.Request(
+            link,
+            headers={"User-Agent": "TravelAdvisoryReport/1.0"},
+        )
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            page_html = resp.read().decode('utf-8', errors='replace')
+    except (urllib.error.URLError, OSError) as exc:
+        logger.warning("Could not fetch CDC notice page %s: %s", link, exc)
+        return []
+
+    notices: list[CDCHealthNotice] = []
+    clean_text = clean_html(page_html)
+
+    # Look for bulleted country lists — common in CDC global notices.
+    # Countries appear as lines in a list, typically after a "current situation"
+    # header.  We look for lines that are short (likely country names) and
+    # appear in sequence.
+    lines = clean_text.split('\n')
+    for line in lines:
+        line = line.strip()
+        # Strip leading bullet markers
+        if line.startswith('- ') or line.startswith('* '):
+            line = line[2:].strip()
+        # Skip long lines (descriptions, not country names)
+        if not line or len(line) > 60 or len(line) < 3:
+            continue
+        # Skip lines that are clearly not country names
+        if any(kw in line.lower() for kw in [
+            'http', 'click', 'learn more', 'see', 'visit', 'page',
+            'what is', 'what should', 'recommendation', 'before you',
+            'after you', 'clinician', 'key points', 'current situation',
+        ]):
+            continue
+        # Must start with uppercase and contain mostly letters
+        if not line[0].isupper():
+            continue
+        # Simple heuristic: a country name is a short line of mostly
+        # alphabetic + space + punctuation characters
+        alpha_ratio = sum(c.isalpha() or c == ' ' for c in line) / len(line)
+        if alpha_ratio < 0.8:
+            continue
+        # Normalize via CDC_NAME_MAP
+        normalized = CDC_NAME_MAP.get(line.lower(), line)
+        # Avoid duplicates
+        if not any(n.country_name.lower() == normalized.lower() for n in notices):
+            notices.append(CDCHealthNotice(
+                country_name=normalized,
+                level=level,
+                level_name=level_name,
+                disease=disease,
+                last_updated=last_updated,
+                link=link,
+            ))
+
+    if notices:
+        logger.info("Expanded CDC notice '%s' into %d country entries", disease, len(notices))
+    else:
+        logger.debug("Could not expand CDC notice at %s into individual countries", link)
+    return notices
+
+
+def match_cdc_notices(
+    notices: list[CDCHealthNotice],
+    prohibited: list[TravelAdvisory],
+    ut_suspended: list[TravelAdvisory],
+    restricted_special: list[TravelAdvisory],
+    high_risk: list[TravelAdvisory],
+) -> tuple[list[TravelAdvisory], list[str]]:
+    """Attach CDC notices to existing advisories or create new entries.
+
+    For each CDCHealthNotice:
+    - Normalize the CDC country name via CDC_NAME_MAP
+    - Search all advisory buckets for a matching country (case-insensitive,
+      substring match consistent with is_prohibited_country() pattern)
+    - If matched: append the CDCHealthNotice to advisory.cdc_notices
+    - If not matched: create a new TravelAdvisory with overall_level=0
+      (sentinel for CDC-only origin) and cdc_notices=[notice].
+      Add to a returned cdc_only list.
+
+    Returns:
+        Tuple of (cdc_only_advisories, unmatched_names) where unmatched_names
+        are CDC country names that could not be resolved at all.
+    """
+    all_advisories = prohibited + ut_suspended + restricted_special + high_risk
+    cdc_only: list[TravelAdvisory] = []
+    unmatched_names: list[str] = []
+    # Track CDC-only countries already created to avoid duplicates
+    cdc_only_seen: dict[str, TravelAdvisory] = {}
+
+    for notice in notices:
+        normalized = CDC_NAME_MAP.get(notice.country_name.lower(), notice.country_name)
+        name_lower = normalized.lower().strip()
+
+        # Search existing advisories for a match
+        matched_adv = None
+        for adv in all_advisories:
+            adv_lower = adv.country_name.lower()
+            if name_lower == adv_lower:
+                matched_adv = adv
+                break
+            if re.search(r'\b' + re.escape(name_lower) + r'\b', adv_lower):
+                matched_adv = adv
+                break
+            if re.search(r'\b' + re.escape(adv_lower) + r'\b', name_lower):
+                matched_adv = adv
+                break
+
+        if matched_adv is not None:
+            matched_adv.cdc_notices.append(notice)
+        else:
+            # Check if we already created a CDC-only entry for this country
+            if name_lower in cdc_only_seen:
+                cdc_only_seen[name_lower].cdc_notices.append(notice)
+            else:
+                new_adv = TravelAdvisory(
+                    country_name=normalized,
+                    country_code="",
+                    overall_level=0,
+                    summary="",
+                    last_updated=notice.last_updated,
+                    link="",
+                    regional_warnings=[],
+                    cdc_notices=[notice],
+                )
+                cdc_only.append(new_adv)
+                cdc_only_seen[name_lower] = new_adv
+
+    return cdc_only, unmatched_names
+
+
 # Canonical risk factor keywords, ordered by severity (most severe first).
 # Used by extract_risk_factors() to normalize and prioritize risk descriptions.
 RISK_FACTORS = [
@@ -1427,6 +1780,10 @@ class TravelAdvisoryPDF(FPDF):
     MEDIUM_GRAY = (100, 100, 100)
     LIGHT_GRAY = (220, 220, 220)
 
+    # CDC notice colors — intentionally quieter than level colors (informational)
+    CDC_LEVEL_3_COLOR = (0, 100, 120)    # Deep teal — Level 3/4 CDC notices
+    CDC_GLOBAL_COLOR = (80, 80, 100)     # Muted slate — global outbreak section
+
     def __init__(self):
         super().__init__()
         self.set_auto_page_break(auto=True, margin=20)
@@ -1618,6 +1975,30 @@ class TravelAdvisoryPDF(FPDF):
                 self.set_draw_color(*self.LIGHT_GRAY)
                 self.set_line_width(0.1)
                 self.line(cat_left, self.get_y(), self.w - cat_right, self.get_y())
+
+        # --- CDC informational stat lines (secondary, MEDIUM_GRAY) ---
+        cdc_global = stats.get('cdc_global_outbreaks', 0)
+        cdc_only_count = stats.get('cdc_only', 0)
+        if cdc_global > 0 or cdc_only_count > 0:
+            self.ln(cat_gap + 2)
+            self.set_font('Helvetica', 'I', 9)
+            self.set_text_color(*self.MEDIUM_GRAY)
+            if cdc_global > 0:
+                self.set_x(cat_left + sq_offset)
+                self.cell(cat_w - sq_offset, desc_h,
+                          self._clean_text(
+                              f'Global Health Alerts (Informational): '
+                              f'{cdc_global} active CDC notices'),
+                          align='L')
+                self.ln(desc_h)
+            if cdc_only_count > 0:
+                self.set_x(cat_left + sq_offset)
+                self.cell(cat_w - sq_offset, desc_h,
+                          self._clean_text(
+                              f'CDC-Only Health Notices (Level 3/4): '
+                              f'{cdc_only_count} countries'),
+                          align='L')
+                self.ln(desc_h)
 
     def add_worldwide_caution_page(self, caution: TravelAdvisory) -> None:
         """Render the worldwide caution advisory on a dedicated page.
@@ -1821,6 +2202,28 @@ class TravelAdvisoryPDF(FPDF):
                         self.multi_cell(0, 5, self._clean_text(region_text),
                                         new_x='LMARGIN', new_y='NEXT')
                     self.ln(2)
+
+        # CDC health notice callout (if any notices are attached)
+        if advisory.cdc_notices:
+            self.set_font('Helvetica', 'B', 10)
+            self.set_text_color(*self.CDC_LEVEL_3_COLOR)
+            self.cell(0, 6, 'CDC Health Notice:')
+            self.ln(6)
+            self.set_font('Helvetica', '', 10)
+            for cdc_n in advisory.cdc_notices:
+                self.set_x(15)
+                self.set_text_color(*self.CDC_LEVEL_3_COLOR)
+                notice_line = (f"Level {cdc_n.level} ({cdc_n.level_name}) "
+                               f"- {cdc_n.disease}")
+                self.multi_cell(0, 5, self._clean_text(notice_line),
+                                new_x='LMARGIN', new_y='NEXT')
+                self.set_x(20)
+                self.set_font('Helvetica', 'I', 9)
+                self.set_text_color(*self.MEDIUM_GRAY)
+                self.multi_cell(0, 4, self._clean_text(cdc_n.link),
+                                new_x='LMARGIN', new_y='NEXT')
+                self.set_font('Helvetica', '', 10)
+            self.ln(2)
 
         # Country summary paragraph
         summary_text = generate_country_summary(advisory)
@@ -2097,6 +2500,176 @@ class TravelAdvisoryPDF(FPDF):
             parts.append(f'{rt} RT region{"s" if rt != 1 else ""}')
         return ', '.join(parts)
 
+    def add_global_outbreak_section(self, outbreaks: list[CDCGlobalOutbreak]):
+        """Add the CDC Global Health Alerts section.
+
+        Only called when len(outbreaks) > 0.
+        Placed between add_summary_section() and the detailed advisories page.
+        """
+        self.add_page()
+
+        # Section header bar
+        band_h = 12
+        self.set_fill_color(*self.CDC_GLOBAL_COLOR)
+        self.set_text_color(255, 255, 255)
+        self.set_font('Helvetica', 'B', 13)
+        self.multi_cell(0, band_h,
+                        '  Global Health Alerts - For Informational Purposes Only',
+                        fill=True, new_x='LMARGIN', new_y='NEXT')
+        self.ln(3)
+
+        # Preamble
+        self.set_font('Helvetica', 'I', 9)
+        self.set_text_color(*self.MEDIUM_GRAY)
+        preamble = (
+            'The notices below are issued by the CDC and indicate disease activity '
+            'affecting multiple regions worldwide. These are NOT high-risk travel '
+            'designations - they do not constitute a travel restriction and are '
+            'provided for traveler awareness only.'
+        )
+        self.multi_cell(0, 4.5, self._clean_text(preamble),
+                        new_x='LMARGIN', new_y='NEXT')
+        self.ln(4)
+
+        # Sort by level descending, then alphabetically by disease
+        sorted_outbreaks = sorted(outbreaks, key=lambda o: (-o.level, o.disease))
+
+        # Table header
+        col_w = (40, 25, 50, 25, 50)  # Disease, Level, Scope, Updated, Link
+        self.set_font('Helvetica', 'B', 9)
+        self.set_fill_color(*self.CDC_GLOBAL_COLOR)
+        self.set_draw_color(*self.CDC_GLOBAL_COLOR)
+        self.set_text_color(255, 255, 255)
+        for label, w in zip(('Disease', 'CDC Level', 'Scope', 'Updated', 'Link'), col_w):
+            self.cell(w, 7, f'  {label}', border=1, fill=True)
+        self.ln(7)
+
+        # Table rows
+        row_h = 6
+        for idx, ob in enumerate(sorted_outbreaks):
+            # Page break check
+            if self.get_y() + row_h > self.h - self.b_margin - 2:
+                self.add_page()
+                self.set_font('Helvetica', 'B', 9)
+                self.set_fill_color(*self.CDC_GLOBAL_COLOR)
+                self.set_draw_color(*self.CDC_GLOBAL_COLOR)
+                self.set_text_color(255, 255, 255)
+                for label, w in zip(('Disease', 'CDC Level', 'Scope', 'Updated', 'Link'), col_w):
+                    self.cell(w, 7, f'  {label}', border=1, fill=True)
+                self.ln(7)
+
+            fill = idx % 2 == 1
+            if fill:
+                self.set_fill_color(*self.LIGHT_GRAY)
+
+            self.set_draw_color(*self.LIGHT_GRAY)
+            self.set_font('Helvetica', '', 9)
+            self.set_text_color(*self.DARK_GRAY)
+            self.cell(col_w[0], row_h, f'  {self._clean_text(ob.disease)}',
+                      border='LR', fill=fill)
+            self.cell(col_w[1], row_h, f'  {ob.level}',
+                      border='LR', fill=fill)
+
+            scope = ob.affected_summary[:25] if len(ob.affected_summary) > 25 else ob.affected_summary
+            self.cell(col_w[2], row_h, f'  {self._clean_text(scope)}',
+                      border='LR', fill=fill)
+
+            date_str = ob.last_updated.strftime('%Y-%m-%d')
+            self.cell(col_w[3], row_h, f'  {date_str}',
+                      border='LR', fill=fill)
+
+            # Truncate link to fit column
+            link_display = ob.link
+            if len(link_display) > 28:
+                link_display = link_display[:28] + '...'
+            self.set_font('Helvetica', 'I', 8)
+            self.set_text_color(*self.MEDIUM_GRAY)
+            self.cell(col_w[4], row_h, f'  {self._clean_text(link_display)}',
+                      border='LR', fill=fill)
+            self.ln(row_h)
+
+        # Below the table, list full URLs for each outbreak
+        self.ln(4)
+        self.set_font('Helvetica', 'I', 8)
+        self.set_text_color(*self.MEDIUM_GRAY)
+        self.cell(0, 4, 'Full CDC Notice URLs:')
+        self.ln(5)
+        for ob in sorted_outbreaks:
+            self.set_x(15)
+            self.multi_cell(0, 3.5,
+                            self._clean_text(f"{ob.disease}: {ob.link}"),
+                            new_x='LMARGIN', new_y='NEXT')
+
+    def add_cdc_only_section(self, cdc_only: list[TravelAdvisory]):
+        """Add section for countries appearing solely due to a CDC Level 3/4 notice.
+
+        Only called when len(cdc_only) > 0.
+        Placed after all State Dept detailed advisory entries.
+        """
+        self.add_page()
+
+        # Section header
+        band_h = 12
+        self.set_fill_color(*self.CDC_LEVEL_3_COLOR)
+        self.set_text_color(255, 255, 255)
+        self.set_font('Helvetica', 'B', 13)
+        self.multi_cell(0, band_h,
+                        '  CDC-Only Health Notices - No State Dept Advisory Issued',
+                        fill=True, new_x='LMARGIN', new_y='NEXT')
+        self.ln(3)
+
+        # Preamble
+        self.set_font('Helvetica', 'I', 9)
+        self.set_text_color(*self.MEDIUM_GRAY)
+        preamble = (
+            'The following countries carry a CDC Level 3 or Level 4 health notice '
+            'but have not been issued a high-risk travel advisory by the US State '
+            'Department. Review the linked CDC notices for full details.'
+        )
+        self.multi_cell(0, 4.5, self._clean_text(preamble),
+                        new_x='LMARGIN', new_y='NEXT')
+        self.ln(5)
+
+        for adv in cdc_only:
+            # Page break check
+            if self.get_y() > 240:
+                self.add_page()
+
+            # Country name header
+            self.set_fill_color(*self.CDC_LEVEL_3_COLOR)
+            self.set_text_color(255, 255, 255)
+            self.set_font('Helvetica', 'B', 11)
+            self.multi_cell(0, 8,
+                            f'  {self._clean_text(adv.country_name)}',
+                            fill=True, new_x='LMARGIN', new_y='NEXT')
+
+            self.set_font('Helvetica', 'I', 9)
+            self.set_text_color(*self.MEDIUM_GRAY)
+            self.multi_cell(0, 5, 'Source: CDC travel health notice only (no State Dept advisory)',
+                            new_x='LMARGIN', new_y='NEXT')
+            self.ln(1)
+
+            # List each CDC notice
+            for cdc_n in adv.cdc_notices:
+                self.set_x(15)
+                self.set_font('Helvetica', '', 10)
+                self.set_text_color(*self.CDC_LEVEL_3_COLOR)
+                notice_line = (f"Level {cdc_n.level} ({cdc_n.level_name}) "
+                               f"- {cdc_n.disease}")
+                self.multi_cell(0, 5, self._clean_text(notice_line),
+                                new_x='LMARGIN', new_y='NEXT')
+                self.set_x(20)
+                self.set_font('Helvetica', 'I', 9)
+                self.set_text_color(*self.MEDIUM_GRAY)
+                self.multi_cell(0, 4, self._clean_text(cdc_n.link),
+                                new_x='LMARGIN', new_y='NEXT')
+
+            self.ln(3)
+            self.set_draw_color(*self.LIGHT_GRAY)
+            self.set_line_width(0.3)
+            self.line(10, self.get_y(), self.epw + 10, self.get_y())
+            self.ln(5)
+
 
 def create_report(
     prohibited: list[TravelAdvisory],
@@ -2105,6 +2678,8 @@ def create_report(
     advisories: list[TravelAdvisory],
     output_path: Path,
     worldwide_caution: 'TravelAdvisory | None' = None,
+    global_outbreaks: list[CDCGlobalOutbreak] | None = None,
+    cdc_only: list[TravelAdvisory] | None = None,
 ) -> Path:
     """Generate the PDF report.
 
@@ -2115,10 +2690,17 @@ def create_report(
         advisories: List of general high-risk advisories to include.
         output_path: Where to save the PDF.
         worldwide_caution: Optional worldwide caution advisory to render on page 2.
+        global_outbreaks: Optional list of CDC global outbreak notices.
+        cdc_only: Optional list of CDC-only advisories (no State Dept advisory).
 
     Returns:
         Path to the generated PDF.
     """
+    if global_outbreaks is None:
+        global_outbreaks = []
+    if cdc_only is None:
+        cdc_only = []
+
     pdf = TravelAdvisoryPDF()
 
     # Calculate statistics
@@ -2131,6 +2713,8 @@ def create_report(
         'level_4': sum(1 for a in advisories if a.overall_level == 4),
         'level_3': sum(1 for a in advisories if a.overall_level == 3),
         'regional': sum(1 for a in advisories if a.overall_level < 3 and a.has_regional_elevation),
+        'cdc_global_outbreaks': len(global_outbreaks),
+        'cdc_only': len(cdc_only),
     }
 
     # Title page with statistics
@@ -2143,6 +2727,10 @@ def create_report(
     # Unified quick-reference table (prohibited + ut_suspended + restricted + high-risk)
     pdf.add_summary_section(prohibited, ut_suspended, restricted_special, advisories)
 
+    # Global Health Alerts (CDC) — only if outbreaks exist
+    if global_outbreaks:
+        pdf.add_global_outbreak_section(global_outbreaks)
+
     # Detailed entries - Level 4 first
     pdf.add_page()
     pdf.set_font('Helvetica', 'B', 16)
@@ -2152,6 +2740,10 @@ def create_report(
 
     for advisory in advisories:
         pdf.add_advisory_entry(advisory)
+
+    # CDC-only countries — after all State Dept detailed entries
+    if cdc_only:
+        pdf.add_cdc_only_section(cdc_only)
 
     # Save
     pdf.output(str(output_path))
@@ -2193,6 +2785,14 @@ class VerificationReport:
         self.entry_count_stable: bool = True
         self.listing_page_count: int | None = None   # cross-validation from HTML listing
         self.used_cache: bool = False                 # True if API cache was used as fallback
+        # CDC health notices
+        self.cdc_fetch_success: bool = True
+        self.cdc_notices_found: int = 0
+        self.cdc_global_outbreaks_found: int = 0
+        self.cdc_global_outbreaks: list[str] = []
+        self.cdc_annotated: list[str] = []
+        self.cdc_only_countries: list[str] = []
+        self.cdc_unmatched: list[str] = []
 
     def check_entry_stability(self, current_count: int, history_path: 'Path') -> None:
         """Compare current raw entry count against recent history and warn on variance.
@@ -2521,6 +3121,28 @@ class VerificationReport:
             for name in sorted(self.missing_expected_regions):
                 lines.append(f"  [WARN] {name} — expected regional warnings but found none")
 
+        # CDC health notices
+        lines.append("")
+        lines.append("--- CDC HEALTH NOTICES ---")
+        lines.append(f"Fetch success:                  {'Yes' if self.cdc_fetch_success else 'No'}")
+        lines.append(f"Level 3/4 notices found:        {self.cdc_notices_found}")
+        lines.append(f"Global outbreak notices (L1/2): {self.cdc_global_outbreaks_found}")
+        if self.cdc_global_outbreaks:
+            for title in self.cdc_global_outbreaks:
+                lines.append(f"  - {title}")
+        lines.append(f"Annotated existing entries:      {len(self.cdc_annotated)}")
+        if self.cdc_annotated:
+            for name in sorted(self.cdc_annotated):
+                lines.append(f"  - {name}")
+        lines.append(f"CDC-only countries (net-new):    {len(self.cdc_only_countries)}")
+        if self.cdc_only_countries:
+            for name in sorted(self.cdc_only_countries):
+                lines.append(f"  - {name}")
+        lines.append(f"Unmatched CDC names:            {len(self.cdc_unmatched)}")
+        if self.cdc_unmatched:
+            for name in self.cdc_unmatched:
+                lines.append(f"  [WARN] {name}")
+
         # Data hash
         lines.append("")
         lines.append("--- DATA HASH ---")
@@ -2655,6 +3277,32 @@ def main():
     verification.populate_high_risk_breakdown(high_risk)
     verification.compute_data_hash(prohibited + ut_suspended + restricted_special + high_risk)
 
+    # Fetch CDC travel health notices (non-fatal)
+    print("Fetching CDC travel health notices...")
+    try:
+        cdc_notices, global_outbreaks = fetch_cdc_notices()
+    except Exception as e:
+        logger.warning("CDC fetch failed: %s", e)
+        cdc_notices, global_outbreaks = [], []
+        verification.cdc_fetch_success = False
+
+    cdc_only, cdc_unmatched = match_cdc_notices(
+        cdc_notices, prohibited, ut_suspended, restricted_special, high_risk
+    )
+
+    verification.cdc_notices_found = len(cdc_notices)
+    verification.cdc_global_outbreaks_found = len(global_outbreaks)
+    verification.cdc_global_outbreaks = [o.title for o in global_outbreaks]
+    verification.cdc_annotated = [
+        a.country_name for a in (prohibited + ut_suspended + restricted_special + high_risk)
+        if a.cdc_notices
+    ]
+    verification.cdc_only_countries = [a.country_name for a in cdc_only]
+    verification.cdc_unmatched = cdc_unmatched
+
+    print(f"CDC: {len(cdc_notices)} Level 3/4 notices, "
+          f"{len(global_outbreaks)} global health alerts.")
+
     print(f"\nProhibited countries (Texas EO GA-48): {len(prohibited)}")
     for adv in prohibited:
         print(f"  - {adv.country_name}")
@@ -2752,7 +3400,9 @@ def main():
     # Generate PDF
     print(f"\nGenerating PDF report...")
     create_report(prohibited, ut_suspended, restricted_special, high_risk, output_path,
-                  worldwide_caution=worldwide_caution)
+                  worldwide_caution=worldwide_caution,
+                  global_outbreaks=global_outbreaks,
+                  cdc_only=cdc_only)
 
     # Write verification log alongside PDF
     verification.write(verification_path)
