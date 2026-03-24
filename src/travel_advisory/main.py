@@ -1847,7 +1847,7 @@ class TravelAdvisoryPDF(FPDF):
         self.set_x(self.l_margin)
         self.set_font('Helvetica', '', 12)
         self.set_text_color(*self.MEDIUM_GRAY)
-        self.cell(self.epw, 6, 'High-Risk Destinations Subject to ITOC Review', align='C')
+        self.cell(self.epw, 6, 'High-Risk Destinations Subject to Institutional Travel Oversight Committee (ITOC) Review', align='C')
         self.ln(6 + 3)
 
         # Generated date
@@ -1874,7 +1874,7 @@ class TravelAdvisoryPDF(FPDF):
         intro_w = self.w - 2 * intro_margin
         intro = (
             'This report identifies international destinations requiring Institutional Travel '
-            'Oversight Committee (ITOC) review under UT System travel policy and Texas Executive '
+            'Oversight Committee (ITOC) review under UT Southwestern travel policy and Texas Executive '
             'Order GA-48. Destinations are categorized by risk level based on US State Department '
             'travel advisories, UT System travel suspensions, and federal foreign adversary '
             'designations. All travel to listed destinations, including layovers and connections, '
@@ -1911,9 +1911,10 @@ class TravelAdvisoryPDF(FPDF):
 
         # (cat_name, count, description, color)
         categories = [
-            ('PROHIBITED (EO GA-48)', stats.get('prohibited', 0),
-             'Designated foreign adversaries per 15 CFR 791.4; work-related travel not '
-             'authorized for state employees under Texas Executive Order GA-48.',
+            ('FOREIGN ADVERSARY (EO GA-48)', stats.get('prohibited', 0),
+             'Designated foreign adversaries per 15 CFR 791.4(a). Travel subject to Texas '
+             'Executive Order GA-48; requires approval from the President, EVP of Academic '
+             'Affairs, and the ITOC.',
              self.PROHIBITED_COLOR),
             ('UT SUSPENDED', stats.get('ut_suspended', 0),
              'Active UT System travel suspension; requires ITOC and University President '
@@ -2111,6 +2112,56 @@ class TravelAdvisoryPDF(FPDF):
             # Render CDC global outbreak content inline (no new page)
             self._render_global_outbreaks(global_outbreaks)
 
+        # --- Key Resources block ---
+        self.ln(6)
+        self.set_draw_color(*self.LIGHT_GRAY)
+        self.set_line_width(0.3)
+        self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
+        self.ln(6)
+
+        self.set_font('Helvetica', 'B', 11)
+        self.set_text_color(*self.NAVY)
+        self.cell(self.epw, 6, 'Key Resources', align='L')
+        self.ln(8)
+
+        # EO GA-48
+        self.set_font('Helvetica', 'B', 10)
+        self.set_text_color(*self.DARK_GRAY)
+        self.cell(self.epw, 5, 'Texas Executive Order GA-48 (Foreign Adversaries)')
+        self.ln(6)
+        self.set_font('Helvetica', '', 9)
+        self.multi_cell(self.epw, 5, self._clean_text(
+            'EO GA-48 designates certain countries as foreign adversaries under 15 CFR 791.4(a). '
+            'Travel to these countries requires a risk-based assessment and prior approval from '
+            'the President, the Executive Vice President of Academic Affairs, and the ITOC.'
+        ), align='L', new_x='LMARGIN', new_y='NEXT')
+        self.ln(1)
+        self.set_font('Helvetica', '', 8)
+        self.set_text_color(*self.MEDIUM_GRAY)
+        self.cell(self.epw, 4,
+                  'https://gov.texas.gov/uploads/files/press/EO-GA-48_Hardening_State_Government_FINAL_11-19-2024.pdf',
+                  align='L')
+        self.ln(7)
+
+        # UT System travel restrictions
+        self.set_font('Helvetica', 'B', 10)
+        self.set_text_color(*self.DARK_GRAY)
+        self.cell(self.epw, 5, 'UT System International Travel Restrictions')
+        self.ln(6)
+        self.set_font('Helvetica', '', 9)
+        self.multi_cell(self.epw, 5, self._clean_text(
+            'The UT System Office of Risk Management maintains current travel restrictions '
+            'and special requirements. See the Special Travel Requirements section near the '
+            'bottom of the page for country-specific restrictions and approval requirements.'
+        ), align='L', new_x='LMARGIN', new_y='NEXT')
+        self.ln(1)
+        self.set_font('Helvetica', '', 8)
+        self.set_text_color(*self.MEDIUM_GRAY)
+        self.cell(self.epw, 4,
+                  'https://www.utsystem.edu/offices/risk-management/international-travel',
+                  align='L')
+        self.ln(5)
+
     def add_prohibited_section(self, prohibited_advisories: list[TravelAdvisory]):
         """Add the prohibited countries section (Texas EO GA-48)."""
         self.add_page()
@@ -2119,7 +2170,7 @@ class TravelAdvisoryPDF(FPDF):
         self.set_fill_color(*self.PROHIBITED_COLOR)
         self.set_text_color(255, 255, 255)
         self.set_font('Helvetica', 'B', 16)
-        self.multi_cell(0, 12, '  PROHIBITED - Travel Not Authorized', fill=True,
+        self.multi_cell(0, 12, '  FOREIGN ADVERSARY - EO GA-48', fill=True,
                         new_x='LMARGIN', new_y='NEXT')
         self.ln(3)
 
@@ -2132,9 +2183,10 @@ class TravelAdvisoryPDF(FPDF):
         self.set_font('Helvetica', '', 11)
         self.set_x(10)
         legal_text = (
-            "Per 15 CFR 791.4, the US Department of Commerce has designated the following "
-            "countries as foreign adversaries. Texas Executive Order GA-48 (November 19, 2024) "
-            "prohibits state employees from work-related travel to these countries."
+            "Per 15 CFR 791.4(a), the US Department of Commerce has designated the following "
+            "countries as foreign adversaries. Travel to these countries is subject to Texas "
+            "Executive Order GA-48 and requires approval from the President, the Executive Vice "
+            "President of Academic Affairs, and the Institutional Travel Oversight Committee (ITOC)."
         )
         self.multi_cell(0, 5, self._clean_text(legal_text))
         self.ln(8)
@@ -2316,7 +2368,7 @@ class TravelAdvisoryPDF(FPDF):
         self.ln(8)
 
     # Column widths for the quick-reference table (total = 190mm effective)
-    _TABLE_COL_W = (50, 68, 72)
+    _TABLE_COL_W = (50, 58, 82)
 
     def _summary_table_header(self):
         """Render the column header row for the quick-reference table."""
@@ -2376,7 +2428,7 @@ class TravelAdvisoryPDF(FPDF):
                 last_updated=matched.last_updated,
                 link=matched.link,
             )
-            rows.append((stub, 'PROHIBITED', self.PROHIBITED_COLOR, 'EO GA-48'))
+            rows.append((stub, 'FOREIGN ADVERSARY', self.PROHIBITED_COLOR, 'EO GA-48; President + EVP Academic Affairs + ITOC req.'))
 
         # UT Suspended countries — iterate the policy dict so all entries always appear,
         # regardless of whether the State Dept API returned a matching advisory.
@@ -2469,16 +2521,14 @@ class TravelAdvisoryPDF(FPDF):
         self.set_text_color(*self.MEDIUM_GRAY)
         self.set_x(preamble_x)
         self.multi_cell(preamble_w, 3.5, self._clean_text(
-            'Note: Prohibited, UT Suspended, and Restricted designations apply to travel '
+            'Note: Foreign Adversary, UT Suspended, and Restricted designations apply to travel '
             'through these countries as a layover or connection point, regardless of '
             'ultimate destination.'
         ), align='L', new_x='LMARGIN', new_y='NEXT')
         self.ln(1)
         self.set_x(preamble_x)
         self.multi_cell(preamble_w, 3.5, self._clean_text(
-            'EO GA-48 = Texas Executive Order GA-48 (foreign adversaries)  |  '
-            'DNT = Do Not Travel (Level 4 regions)  |  '
-            'RT = Reconsider Travel (Level 3 regions)'
+            'EO GA-48 = Texas Executive Order GA-48 (foreign adversaries)'
         ), align='L', new_x='LMARGIN', new_y='NEXT')
         self.ln(2)
         self.line(preamble_x, self.get_y(), preamble_x + preamble_w, self.get_y())
@@ -2562,9 +2612,9 @@ class TravelAdvisoryPDF(FPDF):
         rt = sum(1 for w in adv.regional_warnings if w.level == 3)
         parts = []
         if dnt:
-            parts.append(f'{dnt} DNT region{"s" if dnt != 1 else ""}')
+            parts.append(f'{dnt} Do Not Travel region{"s" if dnt != 1 else ""}')
         if rt:
-            parts.append(f'{rt} RT region{"s" if rt != 1 else ""}')
+            parts.append(f'{rt} Reconsider Travel region{"s" if rt != 1 else ""}')
         return ', '.join(parts)
 
     def add_global_outbreak_section(self, outbreaks: list[CDCGlobalOutbreak]):
