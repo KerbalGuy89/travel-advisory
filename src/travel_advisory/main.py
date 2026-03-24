@@ -2357,11 +2357,16 @@ class TravelAdvisoryPDF(FPDF):
 
         # Link to full advisory
         if advisory.link:
-            self.set_font('Helvetica', 'I', 10)
-            self.set_text_color(0, 76, 151)  # #004c97 Deep Blue
+            self.set_font('Helvetica', '', 9)
+            self.set_text_color(*self.DARK_GRAY)
             self.set_x(10)
-            self.multi_cell(0, 5, f'Full Advisory: {advisory.link}', align='L',
-                            new_x='LMARGIN', new_y='NEXT')
+            self.cell(0, 5, 'Full Advisory: ')
+            self.ln(5)
+            self.set_x(10)
+            self.set_font('Helvetica', 'U', 9)
+            self.set_text_color(0, 0, 200)
+            self.cell(0, 5, advisory.link, link=advisory.link)
+            self.ln(5)
 
         # Divider
         self.ln(5)
@@ -2713,12 +2718,17 @@ class TravelAdvisoryPDF(FPDF):
         self.cell(0, 5, 'CDC Notice Links:')
         self.ln(6)
         for ob in sorted_outbreaks:
-            self.set_font('Helvetica', '', 10)
-            self.set_text_color(0, 0, 0)
+            self.set_font('Helvetica', '', 9)
+            self.set_text_color(*self.DARK_GRAY)
             self.set_x(15)
-            self.multi_cell(0, 5,
-                            self._clean_text(f"{ob.disease}: {ob.link}"),
-                            new_x='LMARGIN', new_y='NEXT')
+            self.cell(0, 5, self._clean_text(f"{ob.disease}: "))
+            x_after_label = self.get_x()
+            self.ln(5)
+            self.set_x(15)
+            self.set_font('Helvetica', 'U', 9)
+            self.set_text_color(0, 0, 200)
+            self.cell(0, 5, ob.link, link=ob.link)
+            self.ln(7)
 
     def add_cdc_only_section(self, cdc_only: list[TravelAdvisory]):
         """Add section for countries appearing solely due to a CDC Level 3/4 notice.
