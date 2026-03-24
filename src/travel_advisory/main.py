@@ -2044,6 +2044,73 @@ class TravelAdvisoryPDF(FPDF):
         self.multi_cell(self.epw, 6, self._clean_text(caution.summary), align='J',
                         new_x='LMARGIN', new_y='NEXT')
 
+    def add_global_awareness_page(
+        self,
+        worldwide_caution: 'TravelAdvisory | None',
+        global_outbreaks: list[CDCGlobalOutbreak],
+    ) -> None:
+        """Render worldwide caution and CDC global alerts on one combined page.
+
+        Only called when at least one of the two sources has data.
+        Worldwide caution renders first (if present), followed by CDC global
+        outbreak table (if any).  If only one source has data the other is
+        simply omitted — no empty section appears.
+        """
+        self.add_page()
+
+        # --- Worldwide Caution block ---
+        if worldwide_caution is not None:
+            # Full-width header band
+            band_h = 16
+            self.set_fill_color(*self.LEVEL_2_COLOR)
+            self.rect(0, self.t_margin, self.w, band_h, style='F')
+            self.set_xy(0, self.t_margin)
+            self.set_font('Helvetica', 'B', 14)
+            self.set_text_color(255, 255, 255)
+            self.cell(self.w, band_h, 'WORLDWIDE CAUTION - US State Department', align='C')
+            self.ln(band_h + 5)
+
+            # Level and date
+            level_name = LEVEL_NAMES.get(worldwide_caution.overall_level, '')
+            level_str = (f'Level {worldwide_caution.overall_level}: {level_name}'
+                         if level_name else f'Level {worldwide_caution.overall_level}')
+            date_str = worldwide_caution.last_updated.strftime('%B %d, %Y')
+            self.set_x(self.l_margin)
+            self.set_font('Helvetica', 'B', 10)
+            self.set_text_color(*self.DARK_GRAY)
+            self.cell(self.epw * 0.5, 6, level_str, align='L')
+            self.set_font('Helvetica', 'I', 10)
+            self.set_text_color(*self.MEDIUM_GRAY)
+            self.cell(self.epw * 0.5, 6, f'Updated: {date_str}', align='R')
+            self.ln(10)
+
+            # Thin rule
+            self.set_draw_color(*self.LIGHT_GRAY)
+            self.set_line_width(0.3)
+            self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
+            self.ln(6)
+
+            # Summary body
+            self.set_x(self.l_margin)
+            self.set_font('Helvetica', '', 10)
+            self.set_text_color(*self.DARK_GRAY)
+            self.multi_cell(self.epw, 6, self._clean_text(worldwide_caution.summary),
+                            align='J', new_x='LMARGIN', new_y='NEXT')
+            self.ln(8)
+
+        # --- CDC Global Health Alerts block ---
+        if global_outbreaks:
+            # If worldwide caution already rendered above, add a separator;
+            # otherwise this is the first content on the page.
+            if worldwide_caution is not None:
+                self.set_draw_color(*self.LIGHT_GRAY)
+                self.set_line_width(0.3)
+                self.line(self.l_margin, self.get_y(), self.w - self.r_margin, self.get_y())
+                self.ln(6)
+
+            # Render CDC global outbreak content inline (no new page)
+            self._render_global_outbreaks(global_outbreaks)
+
     def add_prohibited_section(self, prohibited_advisories: list[TravelAdvisory]):
         """Add the prohibited countries section (Texas EO GA-48)."""
         self.add_page()
@@ -2360,7 +2427,7 @@ class TravelAdvisoryPDF(FPDF):
             key=lambda a: a.country_name,
         )
         for adv in l4:
-            rows.append((adv, '4 - Do Not Travel', self.LEVEL_4_COLOR, ''))
+            rows.append((adv, '4 - Do Not Travel', self.LEVEL_4_COLOR, 'ITOC exemption req.'))
 
         # Level 3 countries
         l3 = sorted(
@@ -2368,7 +2435,7 @@ class TravelAdvisoryPDF(FPDF):
             key=lambda a: a.country_name,
         )
         for adv in l3:
-            rows.append((adv, '3 - Reconsider Travel', self.LEVEL_3_COLOR, ''))
+            rows.append((adv, '3 - Reconsider Travel', self.LEVEL_3_COLOR, 'ITOC exemption req.'))
 
         # Level 2 with regional warnings
         l2_regional = sorted(
@@ -2501,13 +2568,20 @@ class TravelAdvisoryPDF(FPDF):
         return ', '.join(parts)
 
     def add_global_outbreak_section(self, outbreaks: list[CDCGlobalOutbreak]):
-        """Add the CDC Global Health Alerts section.
+        """Add the CDC Global Health Alerts as a standalone page.
 
         Only called when len(outbreaks) > 0.
-        Placed between add_summary_section() and the detailed advisories page.
         """
         self.add_page()
+        self._render_global_outbreaks(outbreaks)
 
+    def _render_global_outbreaks(self, outbreaks: list[CDCGlobalOutbreak]):
+        """Render the CDC Global Health Alerts content at the current position.
+
+        Does not start a new page — caller is responsible for page management.
+        Used by both add_global_outbreak_section() (standalone) and
+        add_global_awareness_page() (combined with worldwide caution).
+        """
         # Section header bar
         band_h = 12
         self.set_fill_color(*self.CDC_GLOBAL_COLOR)
@@ -2534,13 +2608,13 @@ class TravelAdvisoryPDF(FPDF):
         # Sort by level descending, then alphabetically by disease
         sorted_outbreaks = sorted(outbreaks, key=lambda o: (-o.level, o.disease))
 
-        # Table header
-        col_w = (40, 25, 50, 25, 50)  # Disease, Level, Scope, Updated, Link
+        # Table header (no Link column — full URLs listed below the table)
+        col_w = (50, 25, 90, 25)  # Disease, Level, Scope, Updated
         self.set_font('Helvetica', 'B', 9)
         self.set_fill_color(*self.CDC_GLOBAL_COLOR)
         self.set_draw_color(*self.CDC_GLOBAL_COLOR)
         self.set_text_color(255, 255, 255)
-        for label, w in zip(('Disease', 'CDC Level', 'Scope', 'Updated', 'Link'), col_w):
+        for label, w in zip(('Disease', 'CDC Level', 'Scope', 'Updated'), col_w):
             self.cell(w, 7, f'  {label}', border=1, fill=True)
         self.ln(7)
 
@@ -2554,7 +2628,7 @@ class TravelAdvisoryPDF(FPDF):
                 self.set_fill_color(*self.CDC_GLOBAL_COLOR)
                 self.set_draw_color(*self.CDC_GLOBAL_COLOR)
                 self.set_text_color(255, 255, 255)
-                for label, w in zip(('Disease', 'CDC Level', 'Scope', 'Updated', 'Link'), col_w):
+                for label, w in zip(('Disease', 'CDC Level', 'Scope', 'Updated'), col_w):
                     self.cell(w, 7, f'  {label}', border=1, fill=True)
                 self.ln(7)
 
@@ -2570,29 +2644,20 @@ class TravelAdvisoryPDF(FPDF):
             self.cell(col_w[1], row_h, f'  {ob.level}',
                       border='LR', fill=fill)
 
-            scope = ob.affected_summary[:25] if len(ob.affected_summary) > 25 else ob.affected_summary
+            scope = ob.affected_summary[:45] if len(ob.affected_summary) > 45 else ob.affected_summary
             self.cell(col_w[2], row_h, f'  {self._clean_text(scope)}',
                       border='LR', fill=fill)
 
             date_str = ob.last_updated.strftime('%Y-%m-%d')
             self.cell(col_w[3], row_h, f'  {date_str}',
                       border='LR', fill=fill)
-
-            # Truncate link to fit column
-            link_display = ob.link
-            if len(link_display) > 28:
-                link_display = link_display[:28] + '...'
-            self.set_font('Helvetica', 'I', 8)
-            self.set_text_color(*self.MEDIUM_GRAY)
-            self.cell(col_w[4], row_h, f'  {self._clean_text(link_display)}',
-                      border='LR', fill=fill)
             self.ln(row_h)
 
-        # Below the table, list full URLs for each outbreak
+        # Full URLs below table — each on its own line for print readability
         self.ln(4)
         self.set_font('Helvetica', 'I', 8)
         self.set_text_color(*self.MEDIUM_GRAY)
-        self.cell(0, 4, 'Full CDC Notice URLs:')
+        self.cell(0, 4, 'CDC Notice Links:')
         self.ln(5)
         for ob in sorted_outbreaks:
             self.set_x(15)
@@ -2720,16 +2785,13 @@ def create_report(
     # Title page with statistics
     pdf.add_title_page(stats)
 
-    # Worldwide caution page (page 2) — only rendered when present in API data
-    if worldwide_caution is not None:
-        pdf.add_worldwide_caution_page(worldwide_caution)
+    # Combined worldwide caution + CDC global alerts page
+    # Renders only if at least one source has data; omitted entirely otherwise.
+    if worldwide_caution is not None or global_outbreaks:
+        pdf.add_global_awareness_page(worldwide_caution, global_outbreaks)
 
     # Unified quick-reference table (prohibited + ut_suspended + restricted + high-risk)
     pdf.add_summary_section(prohibited, ut_suspended, restricted_special, advisories)
-
-    # Global Health Alerts (CDC) — only if outbreaks exist
-    if global_outbreaks:
-        pdf.add_global_outbreak_section(global_outbreaks)
 
     # Detailed entries - Level 4 first
     pdf.add_page()
