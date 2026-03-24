@@ -2136,11 +2136,12 @@ class TravelAdvisoryPDF(FPDF):
             'the President, the Executive Vice President of Academic Affairs, and the ITOC.'
         ), align='L', new_x='LMARGIN', new_y='NEXT')
         self.ln(1)
-        self.set_font('Helvetica', '', 8)
-        self.set_text_color(*self.MEDIUM_GRAY)
-        self.cell(self.epw, 4,
+        self.set_font('Helvetica', 'U', 9)
+        self.set_text_color(0, 0, 200)
+        self.cell(self.epw, 5,
                   'https://gov.texas.gov/uploads/files/press/EO-GA-48_Hardening_State_Government_FINAL_11-19-2024.pdf',
-                  align='L')
+                  align='L',
+                  link='https://gov.texas.gov/uploads/files/press/EO-GA-48_Hardening_State_Government_FINAL_11-19-2024.pdf')
         self.ln(7)
 
         # UT System travel restrictions
@@ -2149,17 +2150,19 @@ class TravelAdvisoryPDF(FPDF):
         self.cell(self.epw, 5, 'UT System International Travel Restrictions')
         self.ln(6)
         self.set_font('Helvetica', '', 9)
+        self.set_text_color(*self.DARK_GRAY)
         self.multi_cell(self.epw, 5, self._clean_text(
             'The UT System Office of Risk Management maintains current travel restrictions '
             'and special requirements. See the Special Travel Requirements section near the '
             'bottom of the page for country-specific restrictions and approval requirements.'
         ), align='L', new_x='LMARGIN', new_y='NEXT')
         self.ln(1)
-        self.set_font('Helvetica', '', 8)
-        self.set_text_color(*self.MEDIUM_GRAY)
-        self.cell(self.epw, 4,
+        self.set_font('Helvetica', 'U', 9)
+        self.set_text_color(0, 0, 200)
+        self.cell(self.epw, 5,
                   'https://www.utsystem.edu/offices/risk-management/international-travel',
-                  align='L')
+                  align='L',
+                  link='https://www.utsystem.edu/offices/risk-management/international-travel')
         self.ln(5)
 
     def add_prohibited_section(self, prohibited_advisories: list[TravelAdvisory]):
