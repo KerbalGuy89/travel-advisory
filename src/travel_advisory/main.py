@@ -2655,13 +2655,15 @@ class TravelAdvisoryPDF(FPDF):
 
         # Full URLs below table — each on its own line for print readability
         self.ln(4)
-        self.set_font('Helvetica', 'I', 8)
-        self.set_text_color(*self.MEDIUM_GRAY)
-        self.cell(0, 4, 'CDC Notice Links:')
-        self.ln(5)
+        self.set_font('Helvetica', 'B', 10)
+        self.set_text_color(0, 0, 0)
+        self.cell(0, 5, 'CDC Notice Links:')
+        self.ln(6)
         for ob in sorted_outbreaks:
+            self.set_font('Helvetica', '', 10)
+            self.set_text_color(0, 0, 0)
             self.set_x(15)
-            self.multi_cell(0, 3.5,
+            self.multi_cell(0, 5,
                             self._clean_text(f"{ob.disease}: {ob.link}"),
                             new_x='LMARGIN', new_y='NEXT')
 
